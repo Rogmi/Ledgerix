@@ -1,0 +1,14 @@
+# Entornos virtuales
+venv/
+env/
+
+# Caché de Python
+__pycache__/
+*.pyc
+
+Base de datos (Opcional)
+# Descomenta la siguiente línea si NO quieres subir tus registros de prueba a GitHub
+# datos/contabilidad.db
+
+# Configuración de entorno local
+.env
