@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import logica as lg # Conectamos nuestro motor financiero
 import datetime
+import ia_engine as ia
 
 # 1. CONFIGURACIÓN DE LA PÁGINA (Debe ser la primera línea de código)
 st.set_page_config(
@@ -149,14 +150,37 @@ elif menu == "✍️ Registro de Transacciones":
         
         if ia_metodo == "📝 Enunciado de Texto":
             st.info("Pega aquí el caso del profesor (incluso copiando celdas de Excel) y la IA extraerá las transacciones.")
+            
+            # Agregamos la fecha porque la base de datos la exige obligatoriamente
+            fecha_ia = st.date_input("Fecha de la transacción", min_value=datetime.date(2000, 1, 1))
+            
             enunciado_input = st.text_area(
                 "Enunciado contable:", 
                 placeholder="Ej: Se compra 50,000 de mercadería al contado...",
                 height=100
             )
+            
             if st.button("Analizar y Generar Asiento", type="primary", use_container_width=True):
                 if enunciado_input:
-                    st.info("Próximamente: Conexión con Gemini API.")
+                    with st.spinner("🤖 Gemini está analizando el caso aplicando el PCGE..."):
+                        # 1. Le pasamos el texto al cerebro de IA
+                        exito_ia, resultado_ia = ia.extraer_asiento_de_texto(enunciado_input)
+                        
+                        if exito_ia:
+                            st.write("**Interpretación Contable de la IA:**")
+                            st.dataframe(resultado_ia, use_container_width=True) 
+                            
+                            # 2. Usamos el inicio del texto como Glosa y registramos en BD
+                            glosa_corta = (enunciado_input[:45] + '...') if len(enunciado_input) > 45 else enunciado_input
+                            exito_bd, msj = lg.registrar_asiento_completo(fecha_ia, glosa_corta, resultado_ia)
+                            
+                            if exito_bd:
+                                st.success(f"✅ ¡Éxito! {msj}")
+                                st.balloons()
+                            else:
+                                st.error(f"⚠️ La IA estructuró el asiento, pero falló la validación contable: {msj}")
+                        else:
+                            st.error(f"❌ Error de procesamiento: {resultado_ia}")
                 else:
                     st.error("Por favor, ingresa un enunciado.")
                     
