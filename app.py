@@ -67,25 +67,22 @@ if menu == "📊 Dashboard Gerencial":
 
 elif menu == "✍️ Registro de Transacciones":
     st.title("Registro de Transacciones")
-    st.markdown("Ingresa nuevos asientos contables mediante captura manual, voz o escáner.")
+    st.markdown("Ingresa nuevos asientos contables mediante captura manual o el Asistente IA.")
     
-    # Pestañas para los diferentes métodos de ingreso (Preparando la IA de tu 2da Parte)
-    tab_manual, tab_voz, tab_camara = st.tabs(["Captura Manual", "🎙️ Dictado por Voz (IA)", "📷 Escáner de Documentos (IA)"])
+    # Redujimos las pestañas a 2: Manual y el Motor Central IA
+    tab_manual, tab_ia = st.tabs(["✍️ Ingreso Manual", "🤖 Asistente IA (Gemini)"])
     
     with tab_manual:
         st.subheader("Ingreso Manual de Asientos")
         
-        # Consultar el PCGE
         conn = lg.obtener_conexion()
         cuentas_df = pd.read_sql_query("SELECT codigo || ' - ' || descripcion as nombre_cuenta FROM Cuentas", conn)
         lista_cuentas = cuentas_df['nombre_cuenta'].tolist()
         conn.close()
 
-        # Variable de estado para reiniciar el formulario de forma inteligente
         if "form_key" not in st.session_state:
             st.session_state.form_key = 0
 
-        # El formulario ahora tiene un nombre dinámico
         with st.form(f"form_asiento_manual_{st.session_state.form_key}", clear_on_submit=False):
             col1, col2 = st.columns([1, 3])
             with col1:
@@ -114,20 +111,14 @@ elif menu == "✍️ Registro de Transacciones":
                 st.error("⚠️ La glosa es obligatoria.")
             else:
                 detalles_asiento = []
-                # Filtrar filas válidas y dar formato para logica.py
                 for index, row in df_editado.iterrows():
                     if pd.notna(row['Cuenta']): 
                         codigo_cuenta = row['Cuenta'].split(" - ")[0] 
-                        
-                        # Corrección: Si la celda es nula, le asignamos 0.0 de forma segura
                         val_debe = float(row['Debe']) if pd.notna(row['Debe']) else 0.0
                         val_haber = float(row['Haber']) if pd.notna(row['Haber']) else 0.0
                         
-                        detalles_asiento.append({
-                            'cuenta': codigo_cuenta,
-                            'debe': val_debe,
-                            'haber': val_haber
-                        })
+                        detalles_asiento.append({'cuenta': codigo_cuenta, 'debe': val_debe, 'haber': val_haber})
+                        
                 if len(detalles_asiento) < 2:
                     st.error("❌ El asiento debe tener al menos dos movimientos.")
                 else:
@@ -138,21 +129,47 @@ elif menu == "✍️ Registro de Transacciones":
                             st.balloons() 
                             import time
                             time.sleep(1.5)
-                            # Cambiamos la llave para destruir y reconstruir el formulario en blanco
                             st.session_state.form_key += 1 
                             st.rerun()
-                            
                     except ValueError as ve:
                         st.error(f"⚠️ {ve}") 
                     except Exception as e:
                         st.error(f"❌ Error del sistema: {e}")
-    with tab_voz:
-        st.subheader("Captura por Reconocimiento de Voz")
-        st.info("Aquí integraremos el botón de micrófono para dictar transacciones.")
+
+    with tab_ia:
+        st.subheader("🤖 Asistente IA Contable (Gemini)")
+        st.markdown("La Inteligencia Artificial analizará el contexto, identificará las cuentas del PCGE y calculará la partida doble automáticamente.")
         
-    with tab_camara:
-        st.subheader("Procesamiento de Facturas")
-        st.info("Aquí integraremos el lector de cámara para extraer datos automáticos.")
+        ia_metodo = st.radio(
+            "Selecciona el método de captura:", 
+            ["📝 Enunciado de Texto", "🎙️ Dictado por Voz", "📸 Escáner Visual"], 
+            horizontal=True
+        )
+        st.markdown("---")
+        
+        if ia_metodo == "📝 Enunciado de Texto":
+            st.info("Pega aquí el caso del profesor (incluso copiando celdas de Excel) y la IA extraerá las transacciones.")
+            enunciado_input = st.text_area(
+                "Enunciado contable:", 
+                placeholder="Ej: Se compra 50,000 de mercadería al contado...",
+                height=100
+            )
+            if st.button("Analizar y Generar Asiento", type="primary", use_container_width=True):
+                if enunciado_input:
+                    st.info("Próximamente: Conexión con Gemini API.")
+                else:
+                    st.error("Por favor, ingresa un enunciado.")
+                    
+        elif ia_metodo == "🎙️ Dictado por Voz":
+            st.markdown("**Reconocimiento de Voz a Texto**")
+            if st.button("🎤 Iniciar Grabación (Simulación)", type="secondary", use_container_width=True):
+                st.warning("Próximamente: Integración del micrófono web.")
+                
+        elif ia_metodo == "📸 Escáner Visual":
+            st.markdown("**Visión Artificial y OCR**")
+            foto_input = st.file_uploader("Sube una foto de la diapositiva o factura:", type=["png", "jpg", "jpeg"])
+            if foto_input and st.button("Escanear Imagen y Extraer Asiento", type="primary", use_container_width=True):
+                st.info("Próximamente: Conexión con Gemini Vision.")
 
 elif menu == "📑 Estados Financieros":
     st.title("Estados Financieros")
