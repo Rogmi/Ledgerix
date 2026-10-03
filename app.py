@@ -3,8 +3,10 @@ import pandas as pd
 import logica as lg # Conectamos nuestro motor financiero
 import datetime
 import ia_engine as ia
-
+if 'borrador_ia' not in st.session_state:
+    st.session_state.borrador_ia = None
 # 1. CONFIGURACIÓN DE LA PÁGINA (Debe ser la primera línea de código)
+
 st.set_page_config(
     page_title="Ledgerix | Sistema Contable",
     page_icon="📈",
@@ -143,7 +145,7 @@ elif menu == "✍️ Registro de Transacciones":
         
         ia_metodo = st.radio(
             "Selecciona el método de captura:", 
-            ["📝 Enunciado de Texto", "🎙️ Dictado por Voz", "📸 Escáner Visual"], 
+            ["📝 Enunciado de Texto", "📂 Carga Masiva (Excel)", "🎙️ Dictado por Voz", "📸 Escáner Visual"], 
             horizontal=True
         )
         st.markdown("---")
@@ -183,7 +185,89 @@ elif menu == "✍️ Registro de Transacciones":
                             st.error(f"❌ Error de procesamiento: {resultado_ia}")
                 else:
                     st.error("Por favor, ingresa un enunciado.")
+        
+        elif ia_metodo == "📂 Carga Masiva (Excel)":
+            st.info("Sube tu Excel. La IA extraerá los datos y abrirá un Espacio de Trabajo (Borrador) para que revises y corrijas antes de guardar.")
+            
+            archivo_excel = st.file_uploader("Selecciona el documento (.xlsx o .xls)", type=["xlsx", "xls"])
+            
+            if archivo_excel is not None:
+                df_crudo = pd.read_excel(archivo_excel, header=None).dropna(how='all').dropna(axis=1, how='all')
+                
+                # BOTÓN 1: Activar la IA
+                if st.button("✨ Generar Borrador con IA", type="primary", use_container_width=True):
+                    with st.spinner("🧠 Analizando PCGE y deduciendo Costos de Ventas..."):
+                        texto_excel = df_crudo.to_csv(index=False, header=False, na_rep="")
+                        exito_ia, lote_operaciones = ia.analizar_excel_completo(texto_excel)
+                        
+                        if exito_ia:
+                            # Aplanamos el JSON de la IA para crear una tabla estilo Excel
+                            filas_borrador = []
+                            for op in lote_operaciones:
+                                for mov in op["asiento"]:
+                                    filas_borrador.append({
+                                        "Fecha": op["fecha"],
+                                        "Glosa": op["glosa"],
+                                        "Cuenta": str(mov["cuenta"]),
+                                        "Debe": float(mov["debe"]),
+                                        "Haber": float(mov["haber"]),
+                                        "Aprobar": True # Checkbox para el usuario
+                                    })
+                            # Guardamos en la memoria de Streamlit
+                            st.session_state.borrador_ia = pd.DataFrame(filas_borrador)
+                        else:
+                            st.error(lote_operaciones)
+
+                # ZONA DE STAGING: Solo se muestra si hay datos en memoria
+                if st.session_state.borrador_ia is not None:
+                    st.markdown("---")
+                    st.markdown("### 📝 Espacio de Trabajo (Borrador)")
+                    st.warning("Revisa la propuesta de la IA. Puedes hacer doble clic en cualquier celda para corregir cuentas, montos o glosas. Desmarca 'Aprobar' si quieres ignorar una fila.")
                     
+                    # Componente mágico: DataFrame Editable
+                    df_editado = st.data_editor(
+                        st.session_state.borrador_ia,
+                        use_container_width=True,
+                        num_rows="dynamic",
+                        column_config={
+                            "Aprobar": st.column_config.CheckboxColumn("Aprobar", default=True)
+                        }
+                    )
+                    
+                    # BOTÓN 2: Guardar a Base de Datos
+                    if st.button("💾 Confirmar y Guardar Asientos", type="secondary"):
+                        # Filtramos solo los que el usuario dejó con el check
+                        df_final = df_editado[df_editado["Aprobar"] == True]
+                        
+                        # Reagrupamos por Fecha y Glosa para armar el asiento de doble partida
+                        agrupado = df_final.groupby(['Fecha', 'Glosa'])
+                        exitos = 0
+                        
+                        for (fecha_str, glosa), grupo in agrupado:
+                            try:
+                                fecha_obj = datetime.datetime.strptime(str(fecha_str), "%Y-%m-%d").date()
+                            except:
+                                fecha_obj = datetime.date.today()
+                                
+                            asiento_reconstruido = []
+                            for _, fila in grupo.iterrows():
+                                asiento_reconstruido.append({
+                                    "cuenta": str(fila["Cuenta"]),
+                                    "debe": float(fila["Debe"]),
+                                    "haber": float(fila["Haber"])
+                                })
+                            
+                            # Registramos usando tu función original de lógica de negocio
+                            exito_bd, msj = lg.registrar_asiento_completo(fecha_obj, glosa, asiento_reconstruido)
+                            if exito_bd:
+                                exitos += 1
+                                
+                        st.success(f"✅ ¡Excelente! Se guardaron {exitos} asientos revisados en la base de datos.")
+                        st.balloons()
+                        # Limpiamos la memoria para el siguiente archivo
+                        st.session_state.borrador_ia = None
+                        st.rerun()
+
         elif ia_metodo == "🎙️ Dictado por Voz":
             st.markdown("**Reconocimiento de Voz a Texto**")
             if st.button("🎤 Iniciar Grabación (Simulación)", type="secondary", use_container_width=True):
