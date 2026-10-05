@@ -1,0 +1,13 @@
+# Dependencias del Sistema Contable PC2
+# Sin anclas de version para permitir actualizaciones sin friccion.
+# Instalar con: pip install -r requirements.txt
+
+streamlit
+pandas
+openpyxl
+groq
+python-dotenv
+pdfplumber
+python-docx
+Pillow
+pytest
