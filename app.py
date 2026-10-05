@@ -7,6 +7,7 @@ import pandas as pd
 import logica as lg # Conectamos nuestro motor financiero
 import datetime
 import ia_engine as ia
+import transcripcion as voz
 import pdfplumber
 import docx
 import requests
@@ -1024,9 +1025,60 @@ elif menu == "Registro de Transacciones":
                             st.error(lote_operaciones)
 
         elif ia_metodo == "Dictado por Voz":
-            st.markdown("**Reconocimiento de Voz a Texto**")
-            if st.button("Iniciar Grabación (Simulación)", type="secondary", use_container_width=True):
-                st.warning("Próximamente: Integración del micrófono web.")
+            st.markdown("**Reconocimiento de Voz a Texto (Groq Whisper)**")
+            st.info("Graba tu dictado con el micrófono. El audio se transcribirá usando Groq y el texto resultante podrá revisarse antes de generar el asiento.")
+            audio_grabado=None
+            try:
+                audio_grabado=st.audio_input("Grabar audio", type="wav")
+            except Exception:
+                st.error("No se pudo acceder al micrófono. Verifica permisos del navegador/sistema.")
+            if audio_grabado is not None:
+                st.audio(audio_grabado, format="audio/wav")
+                if st.button("Transcribir audio con Groq", type="secondary", use_container_width=True):
+                    try:
+                        audio_bytes=audio_grabado.getvalue()
+                    except Exception:
+                        try:
+                            audio_bytes=audio_grabado.read() if hasattr(audio_grabado,"read") else b""
+                        except Exception:
+                            audio_bytes=b""
+                    if not audio_bytes:
+                        st.error("El audio está vacío.")
+                    else:
+                        with st.spinner("Transcribiendo audio con Groq..."):
+                            exito_t, resultado_t=voz.transcribir_audio_bytes(audio_bytes)
+                        if not exito_t:
+                            st.error(resultado_t)
+                        else:
+                            st.session_state.texto_voz=resultado_t
+                            st.rerun()
+            texto_transcrito=st.session_state.get("texto_voz","")
+            if texto_transcrito:
+                st.text_area("Texto transcrito (editable para revisión)", key="texto_voz", height=120)
+                col1,col2=st.columns(2)
+                with col1:
+                    if st.button("Analizar y generar borrador", type="primary", use_container_width=True):
+                        texto_a_enviar=st.session_state.get("texto_voz","").strip()
+                        if not texto_a_enviar:
+                            st.error("El texto transcrito está vacío.")
+                        else:
+                            with st.spinner("La IA está analizando el dictado aplicando el PCGE..."):
+                                exito_ia, resultado_ia=ia.extraer_asiento_de_texto(texto_a_enviar)
+                                if not exito_ia:
+                                    st.error(f"Error de procesamiento: {resultado_ia}")
+                                elif not isinstance(resultado_ia,list) or not resultado_ia:
+                                    st.error("La IA no devolvió partidas utilizables para este enunciado.")
+                                else:
+                                    glosa_corta=(texto_a_enviar[:45]+"...") if len(texto_a_enviar)>45 else texto_a_enviar
+                                    fecha_voz = resultado_ia[0].get("fecha", "") if isinstance(resultado_ia, list) and resultado_ia and isinstance(resultado_ia[0], dict) else ""
+                                    cargar_borrador([{"fecha": fecha_voz, "glosa": glosa_corta, "asiento": resultado_ia}], "dictado por voz")
+                                    st.session_state.pop("texto_voz",None)
+                                    st.rerun()
+                with col2:
+                    if st.button("Limpiar texto transcrito", use_container_width=True):
+                        st.session_state.pop("texto_voz",None)
+                        st.rerun()
+
 
         elif ia_metodo == "Escáner Visual":
             st.markdown("**Visión Artificial y OCR para Comprobantes / Casos**")
