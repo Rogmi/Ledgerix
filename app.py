@@ -459,10 +459,10 @@ def extraer_texto_de_docx(archivo):
     return texto, None if texto.strip() else "El documento Word está vacío."
 
 
-# Orden estricto del ciclo contable: captura -> estados financieros -> análisis gerencial.
+# Orden estricto del ciclo contable: registro -> libros -> estados financieros -> análisis gerencial.
 # Estos nombres son los que usan los `if menu == ...` del enrutamiento: no cambiarlos por separado.
-MENU_OPCIONES = ["Inicio", "Registro de Transacciones", "Estados Financieros", "Dashboard Gerencial"]
-MENU_ICONOS = ["house", "pen", "file-earmark-spreadsheet", "graph-up"]  # Bootstrap Icons
+MENU_OPCIONES = ["Inicio", "Registro de Transacciones", "Libros Contables", "Estados Financieros", "Dashboard Gerencial"]
+MENU_ICONOS = ["house", "pen", "book", "file-earmark-spreadsheet", "graph-up"]  # Bootstrap Icons
 
 if "menu_option" not in st.session_state:
     st.session_state["menu_option"] = 0  # índice de la opción activa del menú
@@ -1142,6 +1142,213 @@ elif menu == "Registro de Transacciones":
             st.warning(f"{aviso}")
         render_borrador(origen_borrador or "documento")
 
+elif menu == "Libros Contables":
+    st.title("Libros Contables")
+    st.markdown("Registros formales de las operaciones, base para la elaboración de los Estados Financieros.")
+
+    # ------------------------------------------------------------------
+    # Fuente de datos: la base de datos real. Los libros son consultas de SOLO
+    # LECTURA sobre Asientos JOIN Detalles JOIN Cuentas (ver logica.py). No hay
+    # datos de muestra, ni cuentas inventadas, ni numeración de asientos
+    # construida en la interfaz: el N° de asiento es Asientos.id y la
+    # denominación sale de Cuentas.descripcion.
+    # ------------------------------------------------------------------
+    _COLS_DIARIO = ["Fecha", "N° Asiento", "Glosa", "Cuenta PCGE", "Denominación", "Debe", "Haber"]
+    _COLS_MAYOR = ["Fecha", "N° Asiento", "Cuenta PCGE", "Denominación", "Glosa", "Debe", "Haber", "Saldo"]
+
+    _ETIQUETAS = {
+        "fecha": "Fecha", "numero_asiento": "N° Asiento", "glosa": "Glosa",
+        "cuenta": "Cuenta PCGE", "denominacion": "Denominación",
+        "debe": "Debe", "haber": "Haber", "saldo": "Saldo",
+    }
+
+    def _presentar(df, columnas):
+        """Lleva el DataFrame de logica.py a las etiquetas que ya consume la tabla."""
+        if df.empty:
+            return pd.DataFrame(columns=columnas)
+        df = df.rename(columns=_ETIQUETAS)
+        # La fecha llega como texto ISO de SQLite; se pasa a date para que la
+        # columna se muestre con el formato-dd/mm/aaaa y no como texto crudo.
+        df["Fecha"] = pd.to_datetime(df["Fecha"]).dt.date
+        return df[[c for c in columnas if c in df.columns]]
+
+    def _periodo(rango):
+        # date_input devuelve una tupla de 1 elemento mientras el usuario elige la fecha final.
+        if isinstance(rango, (tuple, list)) and len(rango) == 2:
+            return rango[0], rango[1]
+        return None, None
+
+    def _soles(valor):
+        return f"S/ {valor:,.2f}"
+
+    cfg_fecha = st.column_config.DateColumn("Fecha", format="DD/MM/YYYY", width="small")
+    cfg_asiento = st.column_config.TextColumn("N° Asiento", width="small")
+    cfg_glosa = st.column_config.TextColumn("Glosa", width="large")
+    cfg_cuenta = st.column_config.TextColumn("Cuenta PCGE", width="small")
+    cfg_denom = st.column_config.TextColumn("Denominación", width="medium")
+    cfg_debe = st.column_config.NumberColumn("Debe (S/)", format="S/ %.2f", min_value=0, width="small")
+    cfg_haber = st.column_config.NumberColumn("Haber (S/)", format="S/ %.2f", min_value=0, width="small")
+    cfg_saldo = st.column_config.NumberColumn("Saldo (S/)", format="S/ %.2f", width="small")
+
+    # El rango por defecto es el de los asientos realmente registrados, no el de hoy.
+    _fecha_min, _fecha_max = lg.obtener_rango_fechas_asientos()
+    _hay_asientos = _fecha_min is not None
+
+    tab_diario, tab_mayor = st.tabs(["Libro Diario", "Libro Mayor"])
+
+    # ============================ LIBRO DIARIO ============================
+    with tab_diario:
+        st.subheader("Libro Diario")
+        st.caption(
+            "Centralización de los asientos ya validados por el usuario en el motor de Partida Doble. "
+            "Cada operación, ya sea capturada manualmente o interpretada por el Asistente IA, se lee aquí "
+            "en orden cronológico con su cuenta del PCGE, importes al Debe y al Haber, y glosa explicativa. "
+            "Es una consulta de la contabilidad registrada: no crea, no modifica y no recalcula asientos."
+        )
+
+        kpi_diario = st.container()
+
+        if _hay_asientos:
+            with st.container(border=True):
+                st.markdown("**Filtros de consulta**")
+                f1, f2, f3 = st.columns([2, 2, 3])
+                with f1:
+                    rango_d = st.date_input("Periodo", value=(_fecha_min, _fecha_max),
+                                            format="DD/MM/YYYY", key="lc_diario_periodo")
+                with f2:
+                    cuenta_d = st.text_input("Cuenta PCGE", placeholder="Ej.: 10", key="lc_diario_cuenta")
+                with f3:
+                    glosa_d = st.text_input("Buscar en glosa", placeholder="Palabra clave de la operación",
+                                            key="lc_diario_glosa")
+
+            desde_d, hasta_d = _periodo(rango_d)
+            df_diario = _presentar(
+                lg.obtener_libro_diario(desde_d, hasta_d,
+                                        cuenta_d.strip() or None, glosa_d.strip() or None),
+                _COLS_DIARIO,
+            )
+        else:
+            df_diario = pd.DataFrame(columns=_COLS_DIARIO)
+            st.info("Todavía no hay asientos registrados. El Libro Diario se alimenta de los asientos "
+                    "aprobados desde 'Registro de Transacciones'.")
+
+        total_debe_d = float(df_diario["Debe"].sum())
+        total_haber_d = float(df_diario["Haber"].sum())
+        diferencia_d = round(total_debe_d - total_haber_d, 2)
+
+        with kpi_diario:
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Asientos registrados", f"{df_diario['N° Asiento'].nunique()}",
+                      help="Cantidad de asientos contabilizados en el conjunto filtrado.")
+            m2.metric("Total Debe", _soles(total_debe_d), help="Suma de los importes al Debe del conjunto filtrado.")
+            m3.metric("Total Haber", _soles(total_haber_d), help="Suma de los importes al Haber del conjunto filtrado.")
+            m4.metric("Diferencia (Debe - Haber)", _soles(diferencia_d),
+                      delta="Partida doble cuadrada" if diferencia_d == 0 else "Revisar el conjunto filtrado",
+                      delta_color="off" if diferencia_d == 0 else "inverse",
+                      help="Control de cuadre del conjunto filtrado: al ser cero, el Debe y el Haber "
+                           "de lo seleccionado están equilibrados.")
+
+        with st.container(border=True):
+            st.dataframe(
+                df_diario,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Fecha": cfg_fecha,
+                    "N° Asiento": cfg_asiento,
+                    "Glosa": cfg_glosa,
+                    "Cuenta PCGE": cfg_cuenta,
+                    "Denominación": cfg_denom,
+                    "Debe": cfg_debe,
+                    "Haber": cfg_haber,
+                },
+            )
+            if df_diario.empty:
+                st.caption("No se encontraron registros con los filtros aplicados.")
+
+    # ============================= LIBRO MAYOR ============================
+    with tab_mayor:
+        st.subheader("Libro Mayor")
+        st.caption(
+            "Consolidación del Libro Diario por cuenta del PCGE. El sistema agrupa cada movimiento "
+            "según la naturaleza contable de la cuenta (la misma que usan los Estados Financieros) "
+            "y calcula el saldo acumulado de esa cuenta, "
+            "generando la base directa y auditable para la elaboración de los Estados Financieros."
+        )
+
+        kpi_mayor = st.container()
+
+        if _hay_asientos:
+            _cuentas_disponibles = lg.obtener_cuentas_con_movimiento()
+            _opciones_cuenta = ["Todas las cuentas"] + [
+                f"{c} - {d}" for c, d in zip(_cuentas_disponibles["codigo"], _cuentas_disponibles["descripcion"])
+            ]
+
+            with st.container(border=True):
+                st.markdown("**Selección de cuenta**")
+                s1, s2 = st.columns([3, 2])
+                with s1:
+                    cuenta_m = st.selectbox("Cuenta PCGE", options=_opciones_cuenta, index=0,
+                                            key="lc_mayor_cuenta",
+                                            help="Seleccione una cuenta para consultar su movimiento y saldo acumulado.")
+                with s2:
+                    rango_m = st.date_input("Periodo", value=(_fecha_min, _fecha_max),
+                                            format="DD/MM/YYYY", key="lc_mayor_periodo")
+
+            desde_m, hasta_m = _periodo(rango_m)
+            codigo_m = None if cuenta_m == "Todas las cuentas" else cuenta_m.split(" - ", 1)[0]
+            df_mayor = _presentar(lg.obtener_libro_mayor(desde_m, hasta_m, codigo_m), _COLS_MAYOR)
+
+            _naturaleza_m = "acreedora"
+            if codigo_m is not None:
+                _ficha = _cuentas_disponibles[_cuentas_disponibles["codigo"] == codigo_m]
+                if not _ficha.empty:
+                    _naturaleza_m = _ficha["naturaleza"].iloc[0]
+        else:
+            cuenta_m, codigo_m = "Todas las cuentas", None
+            df_mayor = pd.DataFrame(columns=_COLS_MAYOR)
+            st.info("Todavía no hay asientos registrados, así que el Libro Mayor no tiene movimientos "
+                    "que consolidar.")
+
+        total_debe_m = float(df_mayor["Debe"].sum())
+        total_haber_m = float(df_mayor["Haber"].sum())
+
+        with kpi_mayor:
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Cuentas con movimiento", f"{df_mayor['Cuenta PCGE'].nunique()}",
+                      help="Cuentas del PCGE que registran operaciones en el periodo.")
+            k2.metric("Total Debe", _soles(total_debe_m), help="Suma de los cargos del conjunto filtrado.")
+            k3.metric("Total Haber", _soles(total_haber_m), help="Suma de los abonos del conjunto filtrado.")
+            if codigo_m is not None and not df_mayor.empty:
+                k4.metric(f"Saldo final ({_naturaleza_m})", _soles(float(df_mayor["Saldo"].iloc[-1])),
+                          help="Saldo acumulado de la cuenta seleccionada, ya sea deudora o acreedora.")
+            else:
+                k4.caption("Elige una cuenta del listado para ver su saldo acumulado. "
+                           "No se muestra un saldo único para 'Todas las cuentas': cada cuenta tiene "
+                           "naturaleza propia y mezclarlas no produce un saldo contable.")
+
+        with st.container(border=True):
+            st.dataframe(
+                df_mayor,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Fecha": cfg_fecha,
+                    "N° Asiento": cfg_asiento,
+                    "Cuenta PCGE": cfg_cuenta,
+                    "Denominación": cfg_denom,
+                    "Glosa": cfg_glosa,
+                    "Debe": cfg_debe,
+                    "Haber": cfg_haber,
+                    "Saldo": cfg_saldo,
+                },
+            )
+            if df_mayor.empty:
+                st.caption("No se encontraron registros con los filtros aplicados.")
+            elif codigo_m is None:
+                st.caption("La columna Saldo es el acumulado propio de cada cuenta. "
+                           "Selecciona una cuenta para ver su saldo final como indicador.")
+
 elif menu == "Estados Financieros":
     st.title("Estados Financieros")
     st.markdown("Reportes automáticos basados en el Plan Contable General Empresarial (PCGE).")
@@ -1152,6 +1359,8 @@ elif menu == "Estados Financieros":
 
     with tab_balance:
         st.subheader("Estado de Situación Financiera")
+        st.info("Posición financiera a la fecha: lo que la empresa posee (Activos) frente a lo que debe y aporta "
+                "(Pasivo y Patrimonio). Debe cumplirse Activo = Pasivo + Patrimonio.")
 
         if not df_saldos.empty:
             # Separamos las cuentas según el PCGE
@@ -1184,6 +1393,7 @@ elif menu == "Estados Financieros":
 
     with tab_resultados:
         st.subheader("Estado de Resultados Integrales")
+        st.info("Resume los ingresos y gastos del periodo para determinar la utilidad o pérdida del ejercicio.")
 
         if not df_saldos.empty:
             ingresos = df_saldos[df_saldos['elemento'] == 7]
