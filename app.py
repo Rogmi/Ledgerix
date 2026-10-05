@@ -9,6 +9,12 @@ import datetime
 import ia_engine as ia
 import pdfplumber
 import docx
+import requests
+try:
+    from streamlit_lottie import st_lottie
+except ImportError:  # la app sigue funcionando aunque aún no se instale la librería
+    st_lottie = None
+from streamlit_option_menu import option_menu  # pip install streamlit-option-menu
 
 if 'borrador_ia' not in st.session_state:
     st.session_state.borrador_ia = None
@@ -160,7 +166,7 @@ def etiqueta_de_cuenta(codigo, catalogo):
     for etiqueta in catalogo:
         if etiqueta.split(" - ")[0].strip() == codigo:
             return etiqueta
-    return f"{codigo} - ⚠️ fuera del catálogo PCGE"
+    return f"{codigo} - fuera del catálogo PCGE"
 
 
 def cargar_borrador(asientos, origen):
@@ -194,7 +200,7 @@ def render_borrador(origen):
         return
 
     st.markdown("---")
-    st.markdown("### 📝 Borrador para revisión humana")
+    st.markdown("### Borrador para revisión humana")
     st.caption(f"Origen: {origen}. Ningún asiento se guarda sin tu aprobación explícita.")
 
     cat_edicion = obtener_cuentas_pcge()
@@ -219,7 +225,7 @@ def render_borrador(origen):
             col_titulo, col_check = st.columns([0.85, 0.15])
 
             with col_titulo:
-                st.markdown(f"**Asiento #{i + 1} | 📝 {operacion.get('glosa') or 'sin glosa'}**")
+                st.markdown(f"**Asiento #{i + 1} | {operacion.get('glosa') or 'sin glosa'}**")
 
             with col_check:
                 aprobar = st.checkbox("Aprobar", value=True, key=f"chk_aprobar_{clave}")
@@ -227,7 +233,7 @@ def render_borrador(origen):
             # --- FECHA: siempre editable. Si la IA no la encontró, se avisa y se
             # deja vacía; el usuario la ingresa. Nunca se rellena sola.
             if fecha_ia is None:
-                st.warning("⚠️ FECHA NO ENCONTRADA EN EL DOCUMENTO. Ingresa la fecha real "
+                st.warning("FECHA NO ENCONTRADA EN EL DOCUMENTO. Ingresa la fecha real "
                            "para poder guardar este asiento.")
             fecha_elegida = st.date_input(
                 "Fecha del asiento",
@@ -288,22 +294,22 @@ def render_borrador(origen):
             # no se guarda y, por lo tanto, tampoco bloquea al resto.
             if not aprobar:
                 detalle = f" ({'; '.join(problemas)})" if problemas else ""
-                st.info(f"↩️ Sin aprobar: este asiento se descartará{detalle}.")
+                st.info(f"Sin aprobar: este asiento se descartará{detalle}.")
             elif problemas:
-                st.error("❌ Asiento #%d no se puede guardar: %s." % (i + 1, "; ".join(problemas)))
+                st.error("Asiento #%d no se puede guardar: %s." % (i + 1, "; ".join(problemas)))
                 bloqueos.append(f"Asiento #{i + 1}")
             else:
-                st.success(f"✅ Partida doble cuadrada (S/ {total_debe:,.2f}) — listo para guardar")
+                st.success(f"Partida doble cuadrada (S/ {total_debe:,.2f}) — listo para guardar")
                 a_guardar.append({"fecha": fecha_elegida, "glosa": operacion.get("glosa") or "Asiento sin glosa",
                                   "movimientos": movimientos})
 
     st.markdown("---")
     if bloqueos:
-        st.error("❌ No se puede guardar: corrige " + ", ".join(bloqueos)
+        st.error("No se puede guardar: corrige " + ", ".join(bloqueos)
                  + " o desmarca 'Aprobar' para descartarlos.")
     st.caption(f"{len(a_guardar)} asiento(s) aprobados y validados, listos para persistir.")
 
-    if st.button("💾 Guardar Asientos Aprobados en BD", type="primary",
+    if st.button("Guardar Asientos Aprobados en BD", type="primary",
                  disabled=bool(bloqueos) or not a_guardar):
         exitos, errores = 0, []
         for asiento in a_guardar:
@@ -321,10 +327,10 @@ def render_borrador(origen):
 
         st.session_state.borrador_ia = None
         if exitos:
-            st.success(f"✅ Se registraron {exitos} asientos contables en la Base de Datos.")
+            st.success(f"Se registraron {exitos} asientos contables en la Base de Datos.")
             st.balloons()
         for error in errores:
-            st.error(f"❌ No se pudo registrar: {error}")
+            st.error(f"No se pudo registrar: {error}")
         time.sleep(1.5)
         st.rerun()
 
@@ -452,76 +458,392 @@ def extraer_texto_de_docx(archivo):
     return texto, None if texto.strip() else "El documento Word está vacío."
 
 
+# Orden estricto del ciclo contable: captura -> estados financieros -> análisis gerencial.
+# Estos nombres son los que usan los `if menu == ...` del enrutamiento: no cambiarlos por separado.
+MENU_OPCIONES = ["Inicio", "Registro de Transacciones", "Estados Financieros", "Dashboard Gerencial"]
+MENU_ICONOS = ["house", "pen", "file-earmark-spreadsheet", "graph-up"]  # Bootstrap Icons
+
+if "menu_option" not in st.session_state:
+    st.session_state["menu_option"] = 0  # índice de la opción activa del menú
+
+
+def _sincronizar_menu(key: str):
+    """on_change del menú: guarda el índice cuando el usuario hace clic en una opción."""
+    st.session_state["menu_option"] = MENU_OPCIONES.index(st.session_state[key])
+
+
+def _ir_a(destino: str):
+    """Callback de los botones CTA: navegación programática del menú lateral."""
+    st.session_state["menu_option"] = MENU_OPCIONES.index(destino)
+    st.session_state["menu_destino"] = destino
+
+
+def _ir_a_con_pista(destino: str):
+    """Navega desde la portada y marca que debe mostrarse la pista del menú lateral (una sola vez)."""
+    _ir_a(destino)
+    st.session_state["mostrar_pista_menu"] = True
+
+
+# URL pública del Lottie de la portada (analítica / finanzas). Reemplázala por la que elijas en lottiefiles.com
+LOTTIE_URL = "https://assets2.lottiefiles.com/packages/lf20_qp1q7mct.json"
+# Opcional y recomendado para la exposición: guarda el .json aquí y no dependerás de internet
+LOTTIE_LOCAL = "assets/analitica.json"
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def _cargar_lottie(url: str, ruta_local: str):
+    """Carga el Lottie desde archivo local (si existe) o desde la URL. Devuelve None si falla."""
+    import json
+    import os
+    try:
+        if os.path.exists(ruta_local):
+            with open(ruta_local, "r", encoding="utf-8") as f:
+                return json.load(f)
+        r = requests.get(url, timeout=5)
+        return r.json() if r.status_code == 200 else None
+    except Exception:
+        return None
+
+
 # 1. CONFIGURACIÓN DE LA PÁGINA (Debe ser la primera línea de código)
 
 st.set_page_config(
     page_title="Ledgerix | Sistema Contable",
-    page_icon="📈",
+    page_icon=":material/account_balance:",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
 # 2. BARRA LATERAL (NAVEGACIÓN CORPORATIVA)
-st.sidebar.title("Ledgerix 📈")
+st.sidebar.title("Ledgerix")
 st.sidebar.markdown("---")
-menu = st.sidebar.radio(
-    "Navegación del Sistema",
-    ["📊 Dashboard Gerencial", "✍️ Registro de Transacciones", "📑 Estados Financieros"]
-)
+with st.sidebar:
+    seleccion = option_menu(
+        menu_title=None,
+        options=MENU_OPCIONES,
+        icons=MENU_ICONOS,
+        default_index=0,
+        manual_select=st.session_state["menu_option"],  # permite que los botones CTA cambien la opción
+        key="menu_nav",
+        on_change=_sincronizar_menu,
+        styles={
+            "container": {"padding": "4px 0", "background-color": "transparent"},
+            "icon": {"color": "#22D3EE", "font-size": "1.05rem"},
+            "nav-link": {
+                "font-size": "0.97rem", "text-align": "left", "margin": "3px 0",
+                "padding": "10px 14px", "border-radius": "10px", "color": "#CBD5E1",
+                "--hover-color": "rgba(34, 211, 238, 0.12)",
+            },
+            "nav-link-selected": {
+                "background-color": "rgba(16, 185, 129, 0.16)", "color": "#FFFFFF",
+                "font-weight": "600", "border-left": "3px solid #10B981",
+            },
+        },
+    )
 st.sidebar.markdown("---")
 st.sidebar.caption("Ledgerix SaaS - Versión 1.0")
 
+# Si la navegación fue programática (botón CTA), esa orden manda en este primer render;
+# el componente alcanza el mismo estado en el rerun siguiente.
+menu = st.session_state.pop("menu_destino", None) or seleccion
+
 # 3. ENRUTAMIENTO DE MÓDULOS
 
-if menu == "📊 Dashboard Gerencial":
-    st.title("Dashboard Gerencial")
-    st.markdown("Visión general del estado financiero en tiempo real.")
-    
-    # Llamamos a nuestro motor de lógica
-    df_saldos = lg.obtener_saldos_cuentas()
-    
-    total_activos = 0.0
-    total_pasivos = 0.0
-    total_patrimonio = 0.0
-    utilidad = 0.0
-    
-    if not df_saldos.empty:
-        # Filtramos matemáticamente usando el campo 'elemento' del PCGE
-        total_activos = df_saldos[df_saldos['elemento'].isin([1, 2, 3])]['saldo'].sum()
-        total_pasivos = df_saldos[df_saldos['elemento'] == 4]['saldo'].sum()
-        total_patrimonio = df_saldos[df_saldos['elemento'] == 5]['saldo'].sum()
-        
-        ingresos = df_saldos[df_saldos['elemento'] == 7]['saldo'].sum()
-        gastos = df_saldos[df_saldos['elemento'].isin([6, 9])]['saldo'].sum()
-        utilidad = ingresos - gastos
-    
-    # Tarjetas de Métricas (KPIs)
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric(label="Activos Totales", value=f"S/ {total_activos:,.2f}")
-    col2.metric(label="Pasivos Totales", value=f"S/ {total_pasivos:,.2f}")
-    col3.metric(label="Patrimonio", value=f"S/ {total_patrimonio:,.2f}")
-    col4.metric(label="Utilidad del Ejercicio", value=f"S/ {utilidad:,.2f}")
-    
-    st.markdown("---")
-    st.subheader("Saldos Actuales por Cuenta")
-    
-    if not df_saldos.empty:
-        # Mostramos una tabla estilizada con los datos reales
-        st.dataframe(
-            df_saldos[['codigo', 'descripcion', 'saldo']].style.format({'saldo': 'S/ {:.2f}'}), 
-            use_container_width=True,
-            hide_index=True
-        )
-    else:
-        st.info("No hay transacciones registradas todavía.")
+# Pista de navegación: solo aparece al llegar desde un botón de la portada
+if st.session_state.pop("mostrar_pista_menu", False):
+    st.toast("Expande el menú lateral izquierdo para navegar por las demás secciones del sistema.")
 
-elif menu == "✍️ Registro de Transacciones":
+if menu == "Inicio":
+    # ---------- Iconos SVG de línea (sin emojis) ----------
+    def _svg(interior: str, size: int = 28) -> str:
+        return (f'<svg width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" '
+                f'stroke="currentColor" stroke-width="1.6" stroke-linecap="round" '
+                f'stroke-linejoin="round" aria-hidden="true">{interior}</svg>')
+
+    ICO_SUBIR = _svg('<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>')
+    ICO_ARCHIVO = _svg('<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/>')
+    ICO_APROBAR = _svg('<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/>')
+    ICO_CAPAS = _svg('<polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>', 24)
+    ICO_LIBRO = _svg('<path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>', 24)
+    ICO_AUDITOR = _svg('<path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><polyline points="17 11 19 13 23 9"/>', 24)
+    CONECTOR = ('<svg viewBox="0 0 56 12" width="56" height="12" fill="none" stroke="currentColor" '
+                'stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+                '<line class="lx-dash" x1="2" y1="6" x2="46" y2="6" stroke-dasharray="4 4"/>'
+                '<polyline points="44,1.5 53,6 44,10.5"/></svg>')
+
+    # ---------- Estilos (solo se inyectan en "Inicio") ----------
+    st.markdown("""
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
+        [data-testid="stMainBlockContainer"], .block-container {
+            padding: 0 3rem 4rem 3rem !important;
+            max-width: 100% !important;
+        }
+        header[data-testid="stHeader"] { background: transparent !important; }
+        /* ===== HERO: fondo sólido + glow radial sutil ===== */
+        .st-key-lx_hero {
+            width: calc(100% + 6rem) !important;
+            margin-left: -3rem;
+            min-height: 94vh;
+            padding: 6vh 3rem;
+            gap: 1rem !important;
+            justify-content: center;
+            container-type: inline-size;
+            container-name: lxhero;
+            background:
+                radial-gradient(ellipse 50% 38% at 50% 24%,
+                    rgba(34,211,238,0.17) 0%, rgba(16,185,129,0.07) 42%, transparent 72%),
+                #0b0f19;
+        }
+        .lx-brand {
+            font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
+            font-size: clamp(4rem, 11vw, 8.5rem);
+            font-weight: 800;
+            letter-spacing: -0.045em;
+            line-height: 1;
+            text-align: center;
+            margin: 0;
+            background: linear-gradient(180deg, #FFFFFF 40%, #A5F3FC 100%);
+            -webkit-background-clip: text; background-clip: text;
+            -webkit-text-fill-color: transparent;
+            animation: lx-rise .9s ease both;
+        }
+        .lx-tag {
+            text-align: center; color: #94A3B8;
+            font-size: clamp(1rem, 1.7vw, 1.3rem);
+            line-height: 1.5;
+            margin: 20px auto 0 auto; max-width: 760px;
+            animation: lx-rise .9s ease .25s both;
+        }
+        .lx-how {
+            text-align: center; margin: 52px 0 18px 0;
+            font-size: .78rem; letter-spacing: .22em; text-transform: uppercase;
+            color: #10B981; font-weight: 700;
+            animation: lx-rise .8s ease .45s both;
+        }
+        /* ===== Túnel de pasos ===== */
+        .lx-steps {
+            display: flex; align-items: stretch; justify-content: center; gap: 18px;
+            max-width: 980px; margin: 0 auto; padding: 8px 0 2.6rem 0;
+        }
+        .lx-step {
+            flex: 1 1 0; min-width: 0; max-width: 270px;
+            text-align: center; padding: 26px 20px; border-radius: 14px;
+            background: rgba(255,255,255,0.04);
+            border: 1px solid rgba(148,163,184,0.18);
+            animation: lx-rise .8s ease both;
+        }
+        .lx-step.final { border-color: rgba(16,185,129,0.6); box-shadow: 0 0 24px rgba(16,185,129,0.12); }
+        .lx-step-ico { color: #22D3EE; display: flex; justify-content: center; margin-bottom: 12px; }
+        .lx-step-n { color: #10B981; font-size: .7rem; letter-spacing: .18em; font-weight: 700; text-transform: uppercase; }
+        .lx-step-t { color: #F1F5F9; font-weight: 700; font-size: 1.02rem; margin-top: 6px; text-wrap: balance; }
+        .lx-step-h { color: #94A3B8; font-size: .85rem; margin-top: 4px; line-height: 1.4; }
+        .lx-conn { flex: 0 0 auto; align-self: center; padding: 0 4px; color: #22D3EE; opacity: .85; display: flex; animation: lx-rise .8s ease both; }
+        .lx-conn svg { width: 40px; height: auto; }
+        .lx-dash { animation: lx-flow 1.2s linear infinite; }
+        /* ===== CTA principal (Streamlit) ===== */
+        .st-key-cta_principal { animation: lx-rise .8s ease 1.5s both; }
+        .st-key-cta_principal button {
+            background: linear-gradient(90deg, #10B981, #22D3EE) !important;
+            border: none !important; border-radius: 12px !important;
+            min-height: 3.5rem; padding: .9rem 1.5rem;
+            box-shadow: 0 10px 30px rgba(16,185,129,0.30);
+            transition: transform .18s ease, box-shadow .18s ease, filter .18s ease;
+            animation: lx-pulse 2.6s ease-out 2.3s infinite;
+        }
+        .st-key-cta_principal button p, .st-key-cta_principal button div {
+            color: #0b0f19 !important; font-weight: 700 !important; font-size: 1.15rem !important;
+        }
+        .st-key-cta_principal button:hover {
+            transform: translateY(-4px) scale(1.02);
+            box-shadow: 0 16px 38px rgba(34,211,238,0.50);
+            filter: brightness(1.08);
+            animation: none;
+        }
+        .st-key-cta_principal button:active { transform: translateY(-1px); }
+        /* ===== CTA secundario (discreto) ===== */
+        .st-key-cta_secundario { animation: lx-rise .8s ease 1.7s both; }
+        .st-key-cta_secundario button {
+            background: transparent !important;
+            border: 1px solid rgba(148,163,184,0.35) !important;
+            border-radius: 12px !important;
+            transition: border-color .18s ease, background .18s ease;
+        }
+        .st-key-cta_secundario button p, .st-key-cta_secundario button div { color: #CBD5E1 !important; }
+        .st-key-cta_secundario button:hover {
+            border-color: #22D3EE !important; background: rgba(34,211,238,0.08) !important;
+        }
+        /* ===== Contenido bajo el hero (compatible con tema claro/oscuro) ===== */
+        .lx-section {
+            font-size: .8rem; letter-spacing: .2em; text-transform: uppercase;
+            color: #10B981; font-weight: 700; margin: 44px 0 14px 0;
+        }
+        .st-key-lx_lottie {
+            border: 1px solid rgba(148,163,184,0.25); border-radius: 14px;
+            padding: 12px; background: rgba(148,163,184,0.06);
+        }
+        .lx-pillar {
+            display: flex; align-items: center; gap: 16px; padding: 16px 18px; margin-bottom: 12px;
+            border: 1px solid rgba(148,163,184,0.25); border-radius: 12px;
+            background: rgba(148,163,184,0.06);
+        }
+        .lx-pillar-ico {
+            flex: 0 0 auto; width: 48px; height: 48px; display: grid; place-items: center;
+            border-radius: 10px; color: #10B981; background: rgba(16,185,129,0.12);
+        }
+        .lx-pillar-t { font-weight: 700; font-size: 1.05rem; }
+        .lx-pillar-d { opacity: .75; font-size: .95rem; }
+        .lx-footer {
+            max-width: 780px; margin: 64px auto 0 auto; padding: 0 12px 12px 12px;
+            text-align: center; opacity: .6;
+            font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
+            font-size: .8rem; font-weight: 400; letter-spacing: .03em; line-height: 1.8;
+            text-wrap: balance;
+        }
+        .lx-footer::before {
+            content: ""; display: block; width: 56px; height: 2px; margin: 0 auto 20px auto;
+            border-radius: 2px; background: linear-gradient(90deg, #10B981, #22D3EE);
+        }
+        /* Gráfico SVG animado (respaldo si no carga el Lottie) */
+        .lx-chart { display: flex; align-items: center; justify-content: center; min-height: 240px; color: #22D3EE; }
+        .lx-bar {
+            fill: #10B981; transform-box: fill-box; transform-origin: bottom;
+            animation: lx-grow 1.8s ease-in-out infinite alternate;
+        }
+        @keyframes lx-rise  { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
+        @keyframes lx-flow  { to { stroke-dashoffset: -16; } }
+        @keyframes lx-grow  { from { transform: scaleY(.35); } to { transform: scaleY(1); } }
+        @keyframes lx-pulse {
+            0%   { box-shadow: 0 10px 30px rgba(16,185,129,0.30), 0 0 0 0 rgba(34,211,238,0.45); }
+            70%  { box-shadow: 0 10px 30px rgba(16,185,129,0.30), 0 0 0 16px rgba(34,211,238,0); }
+            100% { box-shadow: 0 10px 30px rgba(16,185,129,0.30), 0 0 0 0 rgba(34,211,238,0); }
+        }
+        /* Las reglas responsivas del hero se miden contra su propio ancho (no el de la ventana),
+           porque el menú lateral le quita espacio al contenido. */
+        @container lxhero (max-width: 820px) {
+            .lx-steps { gap: 10px; }
+            .lx-step { padding: 22px 12px; }
+            .lx-step-t { font-size: .92rem; }
+            .lx-step-h { font-size: .78rem; }
+            .lx-conn svg { width: 28px; }
+        }
+        @container lxhero (max-width: 560px) {
+            .lx-steps { flex-direction: column; align-items: center; gap: 6px; }
+            .lx-step { flex: none; width: 100%; max-width: 340px; }
+            .lx-conn { transform: rotate(90deg); margin: 2px 0; }
+            .lx-conn svg { width: 36px; }
+        }
+        @media (max-width: 768px) {
+            [data-testid="stMainBlockContainer"], .block-container { padding: 0 1rem 3rem 1rem !important; }
+            .st-key-lx_hero { width: calc(100% + 2rem) !important; margin-left: -1rem; padding: 5vh 1rem; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            .lx-brand, .lx-tag, .lx-how, .lx-step, .lx-conn, .lx-dash, .lx-bar,
+            .st-key-cta_principal, .st-key-cta_principal button, .st-key-cta_secundario { animation: none !important; }
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # ---------- HERO: logo -> pasos -> botón ----------
+    with st.container(key="lx_hero"):
+        st.markdown(f"""
+        <div class="lx-brand">Ledgerix</div>
+        <div class="lx-tag">El motor de inteligencia artificial para la gestión financiera y contable.</div>
+        <div class="lx-how">Cómo funciona</div>
+        <div class="lx-steps">
+            <div class="lx-step" style="animation-delay:.6s">
+                <div class="lx-step-ico">{ICO_SUBIR}</div>
+                <div class="lx-step-n">Paso 1</div>
+                <div class="lx-step-t">Captura de Datos (IA o Manual)</div>
+                <div class="lx-step-h">Texto, PDF, imagen o voz</div>
+            </div>
+            <div class="lx-conn" style="animation-delay:.75s">{CONECTOR}</div>
+            <div class="lx-step" style="animation-delay:.9s">
+                <div class="lx-step-ico">{ICO_APROBAR}</div>
+                <div class="lx-step-n">Paso 2</div>
+                <div class="lx-step-t">Validación de Partida Doble</div>
+                <div class="lx-step-h">Debe = Haber y PCGE</div>
+            </div>
+            <div class="lx-conn" style="animation-delay:1.05s">{CONECTOR}</div>
+            <div class="lx-step final" style="animation-delay:1.2s">
+                <div class="lx-step-ico">{ICO_ARCHIVO}</div>
+                <div class="lx-step-n">Paso 3</div>
+                <div class="lx-step-t">Generación de EEFF</div>
+                <div class="lx-step-h">Balance y Estado de Resultados</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        _, col_cta, _ = st.columns([1, 1.5, 1])
+        with col_cta:
+            st.button("Iniciar Ciclo Contable  →", key="cta_principal", type="primary",
+                      use_container_width=True, on_click=_ir_a_con_pista, args=("Registro de Transacciones",))
+            st.button("Ver Dashboard Gerencial", key="cta_secundario",
+                      use_container_width=True, on_click=_ir_a_con_pista, args=("Dashboard Gerencial",))
+
+    # ---------- Propuesta de valor: Lottie + 3 frases de una línea ----------
+    st.markdown('<div class="lx-section">Por qué Ledgerix</div>', unsafe_allow_html=True)
+
+    GRAFICO_ANIMADO = """
+    <div class="lx-chart">
+        <svg viewBox="0 0 160 110" width="100%" height="220" aria-hidden="true">
+            <line x1="10" y1="100" x2="150" y2="100" stroke="currentColor" stroke-opacity=".35" stroke-width="1.2"/>
+            <rect class="lx-bar" x="20" y="60" width="16" height="40" rx="2" style="animation-delay:0s"/>
+            <rect class="lx-bar" x="48" y="45" width="16" height="55" rx="2" style="animation-delay:.2s"/>
+            <rect class="lx-bar" x="76" y="52" width="16" height="48" rx="2" style="animation-delay:.4s"/>
+            <rect class="lx-bar" x="104" y="28" width="16" height="72" rx="2" style="animation-delay:.6s"/>
+            <rect class="lx-bar" x="132" y="14" width="16" height="86" rx="2" style="animation-delay:.8s"/>
+        </svg>
+    </div>
+    """
+
+    col_anim, col_pilares = st.columns([1, 1.7], gap="large", vertical_alignment="center")
+    with col_anim:
+        with st.container(key="lx_lottie"):
+            animacion = _cargar_lottie(LOTTIE_URL, LOTTIE_LOCAL) if st_lottie else None
+            if animacion:
+                st_lottie(animacion, height=260, loop=True, quality="medium", key="lottie_analitica")
+            else:
+                st.markdown(GRAFICO_ANIMADO, unsafe_allow_html=True)
+    with col_pilares:
+        st.markdown(f"""
+        <div class="lx-pillar">
+            <div class="lx-pillar-ico">{ICO_CAPAS}</div>
+            <div><div class="lx-pillar-t">Extracción multimodal</div>
+            <div class="lx-pillar-d">Texto, documentos, imagen y voz en un solo flujo.</div></div>
+        </div>
+        <div class="lx-pillar">
+            <div class="lx-pillar-ico">{ICO_LIBRO}</div>
+            <div><div class="lx-pillar-t">Rigor financiero</div>
+            <div class="lx-pillar-d">Partida Doble y PCGE validados en cada asiento.</div></div>
+        </div>
+        <div class="lx-pillar">
+            <div class="lx-pillar-ico">{ICO_AUDITOR}</div>
+            <div><div class="lx-pillar-t">Human-in-the-Loop</div>
+            <div class="lx-pillar-d">Nada se guarda sin la aprobación de un contador.</div></div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ---------- KPIs ----------
+    st.markdown('<div class="lx-section">Impacto proyectado</div>', unsafe_allow_html=True)
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Tiempo de registro", "−80%", help="Reducción estimada frente a la captura manual de asientos.")
+    k2.metric("Asientos descuadrados", "0", help="La validación de Partida Doble (Debe = Haber) bloquea cualquier asiento desbalanceado.")
+    k3.metric("Fuentes de captura", "4", help="Texto, documentos (PDF y Word), imagen y voz.")
+    st.caption("Cifras proyectadas con base en pruebas internas del prototipo; sujetas a validación con datos reales.")
+
+    st.markdown(
+        '<div class="lx-footer">Una iniciativa del Grupo 7 para el curso de Sistema y Gestión Financiera, '
+        'a cargo del profesor MBA John Valle Santos - Universidad Nacional de Ingeniería (UNI).</div>',
+        unsafe_allow_html=True)
+
+elif menu == "Registro de Transacciones":
     st.title("Registro de Transacciones")
     st.markdown("Ingresa nuevos asientos contables mediante captura manual o el Asistente IA.")
-    
+
     # Redujimos las pestañas a 2: Manual y el Motor Central IA
-    tab_manual, tab_ia = st.tabs(["✍️ Ingreso Manual", "🤖 Asistente IA (Gemini)"])
-    
+    tab_manual, tab_ia = st.tabs(["Ingreso Manual", "Asistente IA (Gemini)"])
+
     with tab_manual:
         st.subheader("Ingreso Manual de Asientos")
         st.info("Captura el asiento y envíalo al borrador. Allí lo apruebas y recién "
@@ -538,9 +860,9 @@ elif menu == "✍️ Registro de Transacciones":
                 fecha_input = st.date_input("Fecha de la transacción",min_value=datetime.date(2000, 1, 1))
             with col2:
                 glosa_input = st.text_input("Glosa / Descripción de la operación", placeholder="Ej. Por el aporte de capital inicial")
-            
+
             st.markdown("**Detalle del Asiento (Partida Doble)**")
-            
+
             df_inicial = pd.DataFrame([{"Cuenta": None, "Debe": 0.0, "Haber": 0.0} for _ in range(2)])
             df_editado = st.data_editor(
                 df_inicial,
@@ -549,27 +871,27 @@ elif menu == "✍️ Registro de Transacciones":
                     "Debe": st.column_config.NumberColumn("Debe (S/)", min_value=0.0, format="%.2f"),
                     "Haber": st.column_config.NumberColumn("Haber (S/)", min_value=0.0, format="%.2f")
                 },
-                num_rows="dynamic", 
+                num_rows="dynamic",
                 use_container_width=True
             )
-            
+
             submit_btn = st.form_submit_button("Enviar al borrador", type="primary")
-            
+
         if submit_btn:
             if not glosa_input:
-                st.error("⚠️ La glosa es obligatoria.")
+                st.error("La glosa es obligatoria.")
             else:
                 detalles_asiento = []
                 for index, row in df_editado.iterrows():
-                    if pd.notna(row['Cuenta']): 
-                        codigo_cuenta = row['Cuenta'].split(" - ")[0] 
+                    if pd.notna(row['Cuenta']):
+                        codigo_cuenta = row['Cuenta'].split(" - ")[0]
                         val_debe = float(row['Debe']) if pd.notna(row['Debe']) else 0.0
                         val_haber = float(row['Haber']) if pd.notna(row['Haber']) else 0.0
-                        
+
                         detalles_asiento.append({'cuenta': codigo_cuenta, 'debe': val_debe, 'haber': val_haber})
-                        
+
                 if len(detalles_asiento) < 2:
-                    st.error("❌ El asiento debe tener al menos dos movimientos.")
+                    st.error("El asiento debe tener al menos dos movimientos.")
                 else:
                     # El asiento manual entra al MISMO borrador que la IA: no se
                     # escribe nada en la base de datos todavía.
@@ -582,17 +904,17 @@ elif menu == "✍️ Registro de Transacciones":
                     st.rerun()
 
     with tab_ia:
-        st.subheader("🤖 Asistente IA Contable (Gemini)")
+        st.subheader("Asistente IA Contable (Gemini)")
         st.markdown("La Inteligencia Artificial analizará el contexto, identificará las cuentas del PCGE y calculará la partida doble automáticamente.")
-        
+
         ia_metodo = st.radio(
-            "Selecciona el método de captura:", 
-            ["📝 Enunciado de Texto", "📂 Carga de Documentos (Excel, PDF, Word)", "🎙️ Dictado por Voz", "📸 Escáner Visual"], 
+            "Selecciona el método de captura:",
+            ["Enunciado de Texto", "Carga de Documentos (Excel, PDF, Word)", "Dictado por Voz", "Escáner Visual"],
             horizontal=True
         )
         st.markdown("---")
-        
-        if ia_metodo == "📝 Enunciado de Texto":
+
+        if ia_metodo == "Enunciado de Texto":
             st.info("Pega aquí el caso del profesor (incluso copiando celdas de Excel). "
                     "La IA Arma la partida doble y el resultado pasa al borrador: "
                     "lo revisas, lo corriges y lo apruebas antes de guardarse.")
@@ -600,22 +922,22 @@ elif menu == "✍️ Registro de Transacciones":
             # La fecha la elige el usuario. Si la deja en la fecha por defecto de
             # Streamlit, el borrador la mostrará como dato a confirmar.
             fecha_ia = st.date_input("Fecha de la transacción", min_value=datetime.date(2000, 1, 1))
-            
+
             enunciado_input = st.text_area(
-                "Enunciado contable:", 
+                "Enunciado contable:",
                 placeholder="Ej: Se compra 50,000 de mercadería al contado...",
                 height=100
             )
-            
+
             if st.button("Analizar y Generar Borrador", type="primary", use_container_width=True):
                 if enunciado_input:
-                    with st.spinner("🤖 Gemini está analizando el caso aplicando el PCGE..."):
+                    with st.spinner("Gemini está analizando el caso aplicando el PCGE..."):
                         exito_ia, resultado_ia = ia.extraer_asiento_de_texto(enunciado_input)
-                        
+
                         if not exito_ia:
-                            st.error(f"❌ Error de procesamiento: {resultado_ia}")
+                            st.error(f"Error de procesamiento: {resultado_ia}")
                         elif not isinstance(resultado_ia, list) or not resultado_ia:
-                            st.error("❌ La IA no devolvió partidas utilizables para este enunciado.")
+                            st.error("La IA no devolvió partidas utilizables para este enunciado.")
                         else:
                             # Un enunciado es UN asiento con las partidas que la IA
                             # entrego. No se agrupa ni se reordena nada.
@@ -628,13 +950,13 @@ elif menu == "✍️ Registro de Transacciones":
                             st.rerun()
                 else:
                     st.error("Por favor, ingresa un enunciado.")
-        
-        elif ia_metodo == "📂 Carga de Documentos (Excel, PDF, Word)":
+
+        elif ia_metodo == "Carga de Documentos (Excel, PDF, Word)":
             st.info("Sube tu archivo. La IA extraerá los datos y abrirá un Espacio de Trabajo (Borrador) para que revises y corrijas antes de guardar.")
-            
+
             # Ampliamos los tipos de archivo permitidos
             archivo_doc = st.file_uploader("Selecciona el documento", type=["xlsx", "xls", "pdf", "docx"])
-            
+
             if archivo_doc is not None:
                 # 1. ENRUTADOR DE EXTRACCIÓN DE TEXTO
                 extension = archivo_doc.name.split('.')[-1].lower()
@@ -664,7 +986,7 @@ elif menu == "✍️ Registro de Transacciones":
                 texto_para_ia, informe = sanitizar_texto_para_ia(texto_crudo)
 
                 if informe["control_eliminados"]:
-                    st.caption(f"🧹 Se eliminaron {informe['control_eliminados']:,} caracteres de "
+                    st.caption(f"Se eliminaron {informe['control_eliminados']:,} caracteres de "
                                "control del documento antes de enviarlo a la IA.")
                 if not texto_para_ia:
                     st.error("El documento no tiene texto legible. Si es un escaneo, "
@@ -673,7 +995,7 @@ elif menu == "✍️ Registro de Transacciones":
                     st.caption(f"Documento listo para la IA: {informe['caracteres_enviados']:,} caracteres "
                                f"(original: {informe['caracteres_originales']:,}).")
                     if informe["recortado"]:
-                        st.warning(f"⚠️ El documento supera el límite de {MAX_CHARS_PARA_IA:,} caracteres que "
+                        st.warning(f"El documento supera el límite de {MAX_CHARS_PARA_IA:,} caracteres que "
                                    "acepta una petición de la API. Se enviará leído por bloques, en orden y "
                                    "sin descartar ningún contenido.")
 
@@ -683,11 +1005,11 @@ elif menu == "✍️ Registro de Transacciones":
                                      height=200, disabled=True)
 
                     # 3. BOTÓN DE IA (el texto que se previsualiza es el que se envía)
-                if st.button("✨ Generar Borrador con IA", type="primary", use_container_width=True):
-                    with st.spinner("📄 Extrayendo filas del documento y armando la partida doble..."):
+                if st.button("Generar Borrador con IA", type="primary", use_container_width=True):
+                    with st.spinner("Extrayendo filas del documento y armando la partida doble..."):
                         # Mandamos EXACTAMENTE el texto ya saneado y previsualizado
                         exito_ia, lote_operaciones = ia.analizar_excel_completo(texto_para_ia)
-                        
+
                         if exito_ia:
                             # El lote crudo va al borrador comun: cada elemento es un
                             # asiento y sus partidas se conservan tal cual llegaron.
@@ -695,18 +1017,18 @@ elif menu == "✍️ Registro de Transacciones":
                             filas = sum(len(op["asiento"]) for op in lote_operaciones)
                             st.session_state.avisos_borrador = getattr(lote_operaciones, "avisos", [])
                             st.session_state.resumen_borrador = (
-                                f"📄 {filas} fila(s) transcrita(s) en {len(lote_operaciones)} asiento(s)."
+                                f"{filas} fila(s) transcrita(s) en {len(lote_operaciones)} asiento(s)."
                             )
                             st.rerun()
                         else:
                             st.error(lote_operaciones)
 
-        elif ia_metodo == "🎙️ Dictado por Voz":
+        elif ia_metodo == "Dictado por Voz":
             st.markdown("**Reconocimiento de Voz a Texto**")
-            if st.button("🎤 Iniciar Grabación (Simulación)", type="secondary", use_container_width=True):
+            if st.button("Iniciar Grabación (Simulación)", type="secondary", use_container_width=True):
                 st.warning("Próximamente: Integración del micrófono web.")
-                
-        elif ia_metodo == "📸 Escáner Visual":
+
+        elif ia_metodo == "Escáner Visual":
             st.markdown("**Visión Artificial y OCR para Comprobantes / Casos**")
             st.info("Puedes tomar una foto directamente o subir una imagen guardada. La IA leerá los datos espaciales y generará los asientos.")
 
@@ -720,23 +1042,23 @@ elif menu == "✍️ Registro de Transacciones":
             # hardware. La camara queda como segunda opcion, nunca como la primera.
             origen_imagen = st.radio(
                 "Origen de la imagen",
-                ["📂 Subir Archivo", "📸 Usar Cámara"],
+                ["Subir Archivo", "Usar Cámara"],
                 horizontal=True,
             )
 
             # Las condiciones comparan contra el VALOR de la opcion, no contra su
             # posicion, asi que invertir la lista no obliga a reordenar este bloque.
             imagen_final = None
-            if origen_imagen == "📂 Subir Archivo":
-                imagen_final = st.file_uploader("📂 Sube una imagen:", type=["png", "jpg", "jpeg"])
-            elif origen_imagen == "📸 Usar Cámara":
-                imagen_final = st.camera_input("📸 Tomar foto (Cámara)")
+            if origen_imagen == "Subir Archivo":
+                imagen_final = st.file_uploader("Sube una imagen:", type=["png", "jpg", "jpeg"])
+            elif origen_imagen == "Usar Cámara":
+                imagen_final = st.camera_input("Tomar foto (Cámara)")
 
             if imagen_final:
                 st.image(imagen_final, caption="Documento listo para analizar", width=350)
 
-                if st.button("✨ Escanear Imagen y Extraer Asiento", type="primary", use_container_width=True):
-                    with st.spinner("👁️ Llama 3.2 Vision está analizando el comprobante..."):
+                if st.button("Escanear Imagen y Extraer Asiento", type="primary", use_container_width=True):
+                    with st.spinner("Llama 3.2 Vision está analizando el comprobante..."):
                         # getvalue() entrega los bytes crudos: es lo que espera el motor
                         # visual. read() con decodificacion daria texto y no una imagen.
                         imagen_bytes = imagen_final.getvalue()
@@ -750,7 +1072,7 @@ elif menu == "✍️ Registro de Transacciones":
                             filas = sum(len(op["asiento"]) for op in lote_operaciones)
                             st.session_state.avisos_borrador = getattr(lote_operaciones, "avisos", [])
                             st.session_state.resumen_borrador = (
-                                f"📸 {filas} partida(s) extraída(s) visualmente en {len(lote_operaciones)} asiento(s)."
+                                f"{filas} partida(s) extraída(s) visualmente en {len(lote_operaciones)} asiento(s)."
                             )
                             st.rerun()
                         else:
@@ -765,72 +1087,114 @@ elif menu == "✍️ Registro de Transacciones":
         if st.session_state.get("resumen_borrador"):
             st.caption(st.session_state["resumen_borrador"])
         for aviso in st.session_state.get("avisos_borrador", []):
-            st.warning(f"⚠️ {aviso}")
+            st.warning(f"{aviso}")
         render_borrador(origen_borrador or "documento")
 
-elif menu == "📑 Estados Financieros":
+elif menu == "Estados Financieros":
     st.title("Estados Financieros")
     st.markdown("Reportes automáticos basados en el Plan Contable General Empresarial (PCGE).")
-    
+
     df_saldos = lg.obtener_saldos_cuentas()
-    
+
     tab_balance, tab_resultados = st.tabs(["Balance General", "Estado de Resultados"])
-    
+
     with tab_balance:
         st.subheader("Estado de Situación Financiera")
-        
+
         if not df_saldos.empty:
             # Separamos las cuentas según el PCGE
             activos = df_saldos[df_saldos['elemento'].isin([1, 2, 3])]
             pasivos_patrimonio = df_saldos[df_saldos['elemento'].isin([4, 5])]
-            
+
             # Calculamos la utilidad del periodo para cuadrar el balance
             ingresos_tot = df_saldos[df_saldos['elemento'] == 7]['saldo'].sum()
             gastos_tot = df_saldos[df_saldos['elemento'].isin([6, 9])]['saldo'].sum()
             utilidad = ingresos_tot - gastos_tot
-            
+
             col_activo, col_pasivo = st.columns(2)
-            
+
             with col_activo:
                 st.markdown("### Activos")
                 st.dataframe(activos[['codigo', 'descripcion', 'saldo']].style.format({'saldo': 'S/ {:.2f}'}), hide_index=True, use_container_width=True)
                 st.success(f"**Total Activos: S/ {activos['saldo'].sum():,.2f}**")
-                
+
             with col_pasivo:
                 st.markdown("### Pasivos y Patrimonio")
                 st.dataframe(pasivos_patrimonio[['codigo', 'descripcion', 'saldo']].style.format({'saldo': 'S/ {:.2f}'}), hide_index=True, use_container_width=True)
                 if utilidad != 0:
                     st.caption(f"*Utilidad del Ejercicio a distribuir: S/ {utilidad:,.2f}*")
-                
+
                 total_p_y_p = pasivos_patrimonio['saldo'].sum() + utilidad
                 st.error(f"**Total Pasivo + Patrimonio: S/ {total_p_y_p:,.2f}**")
-                
+
         else:
             st.info("Aún no hay registros para procesar el Balance General.")
-            
+
     with tab_resultados:
         st.subheader("Estado de Resultados Integrales")
-        
+
         if not df_saldos.empty:
             ingresos = df_saldos[df_saldos['elemento'] == 7]
             gastos = df_saldos[df_saldos['elemento'].isin([6, 9])]
-            
+
             col_ing, col_gas = st.columns(2)
-            
+
             with col_ing:
                 st.markdown("### Ingresos")
                 if not ingresos.empty:
                     st.dataframe(ingresos[['codigo', 'descripcion', 'saldo']].style.format({'saldo': 'S/ {:.2f}'}), hide_index=True, use_container_width=True)
                 st.success(f"**Total Ingresos: S/ {ingresos_tot:,.2f}**")
-                
+
             with col_gas:
                 st.markdown("### Gastos")
                 if not gastos.empty:
                     st.dataframe(gastos[['codigo', 'descripcion', 'saldo']].style.format({'saldo': 'S/ {:.2f}'}), hide_index=True, use_container_width=True)
                 st.error(f"**Total Gastos: S/ {gastos_tot:,.2f}**")
-            
+
             st.markdown("---")
             color_utilidad = "normal" if utilidad >= 0 else "inverse"
             st.metric(label="RESULTADO DEL EJERCICIO (Utilidad / Pérdida)", value=f"S/ {utilidad:,.2f}", delta_color=color_utilidad)
         else:
             st.info("Aún no hay registros de ingresos o gastos para procesar.")
+
+elif menu == "Dashboard Gerencial":
+    st.title("Dashboard Gerencial")
+    st.markdown("Visión general del estado financiero en tiempo real.")
+
+    # Llamamos a nuestro motor de lógica
+    df_saldos = lg.obtener_saldos_cuentas()
+
+    total_activos = 0.0
+    total_pasivos = 0.0
+    total_patrimonio = 0.0
+    utilidad = 0.0
+
+    if not df_saldos.empty:
+        # Filtramos matemáticamente usando el campo 'elemento' del PCGE
+        total_activos = df_saldos[df_saldos['elemento'].isin([1, 2, 3])]['saldo'].sum()
+        total_pasivos = df_saldos[df_saldos['elemento'] == 4]['saldo'].sum()
+        total_patrimonio = df_saldos[df_saldos['elemento'] == 5]['saldo'].sum()
+
+        ingresos = df_saldos[df_saldos['elemento'] == 7]['saldo'].sum()
+        gastos = df_saldos[df_saldos['elemento'].isin([6, 9])]['saldo'].sum()
+        utilidad = ingresos - gastos
+
+    # Tarjetas de Métricas (KPIs)
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric(label="Activos Totales", value=f"S/ {total_activos:,.2f}")
+    col2.metric(label="Pasivos Totales", value=f"S/ {total_pasivos:,.2f}")
+    col3.metric(label="Patrimonio", value=f"S/ {total_patrimonio:,.2f}")
+    col4.metric(label="Utilidad del Ejercicio", value=f"S/ {utilidad:,.2f}")
+
+    st.markdown("---")
+    st.subheader("Saldos Actuales por Cuenta")
+
+    if not df_saldos.empty:
+        # Mostramos una tabla estilizada con los datos reales
+        st.dataframe(
+            df_saldos[['codigo', 'descripcion', 'saldo']].style.format({'saldo': 'S/ {:.2f}'}),
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info("No hay transacciones registradas todavía.")
