@@ -266,15 +266,57 @@ def cargar_borrador(asientos, origen):
     usa en las claves de los widgets para que un borrador nuevo no herede los
     valores que el humano ya habia escrito en el anterior.
     """
-    st.session_state.borrador_ia = list(asientos)
-    st.session_state.borrador_id = st.session_state.get("borrador_id", 0) + 1
-    st.session_state.origen_borrador = origen
+    previo = list(st.session_state.get("borrador_ia") or [])
+    # Cada asiento recuerda de que herramienta vino (se muestra en su cabecera).
+    nuevos = [dict(a, _origen=origen) if isinstance(a, dict) else a for a in asientos]
+    # MODO ACUMULATIVO: si ya hay un borrador pendiente, los asientos nuevos se
+    # AGREGAN al final (extend) en lugar de sobrescribirlo. Asi se puede mezclar,
+    # por ejemplo, un Excel con un dictado sin perder lo ya cargado.
+    if previo:
+        previo.extend(nuevos)
+        st.session_state.borrador_ia = previo
+    else:
+        st.session_state.borrador_ia = nuevos
+    # Si se acumula, los asientos ya cargados conservan sus claves de widget y, por
+    # tanto, lo que el humano ya edito en ellos. Solo un borrador nuevo renueva la identidad.
+    if not previo:
+        st.session_state.borrador_id = st.session_state.get("borrador_id", 0) + 1
+    origen_previo = st.session_state.get("origen_borrador") if previo else None
+    if not origen_previo:
+        st.session_state.origen_borrador = origen
+    elif origen not in origen_previo:
+        st.session_state.origen_borrador = f"{origen_previo} + {origen}"
+    # Quien llama a esta funcion escribe despues los avisos y el resumen del lote
+    # NUEVO. Al acumular, los del lote anterior se archivan para no perderlos.
+    if previo:
+        st.session_state["_avisos_hist"] = (list(st.session_state.get("_avisos_hist", []))
+                                            + list(st.session_state.get("avisos_borrador") or []))
+        _resumen_previo = st.session_state.get("resumen_borrador")
+        st.session_state["_resumen_hist"] = (list(st.session_state.get("_resumen_hist", []))
+                                             + ([_resumen_previo] if _resumen_previo else []))
+    else:
+        st.session_state["_avisos_hist"] = []
+        st.session_state["_resumen_hist"] = []
     st.session_state.avisos_borrador = []
     st.session_state.resumen_borrador = ""
     # La huella solo la vuelve a poner el flujo de Excel, despues de cargar el
     # borrador. Asi, un dictado, un PDF, un escaner o una captura manual nunca
     # heredan la identidad de un Excel anterior.
+    # Al acumular, el Excel ya cargado sigue formando parte del lote: su huella (y la
+    # advertencia de duplicado) debe seguir vigente. Solo un borrador nuevo la descarta.
+    if not previo:
+        st.session_state.pop("huella_documento", None)
+
+
+def _vaciar_borrador():
+    """Descarta el borrador pendiente. Solo estado de sesion: no toca la base de datos."""
+    st.session_state.borrador_ia = None
+    st.session_state.avisos_borrador = []
+    st.session_state.resumen_borrador = ""
+    st.session_state["_avisos_hist"] = []
+    st.session_state["_resumen_hist"] = []
     st.session_state.pop("huella_documento", None)
+    st.session_state.pop("origen_borrador", None)
 
 
 def render_borrador(origen):
@@ -320,7 +362,8 @@ def render_borrador(origen):
             col_titulo, col_check = st.columns([0.85, 0.15])
 
             with col_titulo:
-                st.markdown(f"**Asiento #{i + 1} | {operacion.get('glosa') or 'sin glosa'}**")
+                _tag_origen = f"  \n:gray[Origen: {operacion['_origen']}]" if operacion.get("_origen") else ""
+                st.markdown(f"**Asiento #{i + 1} | {operacion.get('glosa') or 'sin glosa'}**{_tag_origen}")
 
             with col_check:
                 aprobar = st.checkbox("Aprobar", value=True, key=f"chk_aprobar_{clave}")
@@ -441,7 +484,7 @@ def render_borrador(origen):
         st.session_state.borrador_ia = None
         if exitos:
             st.success(f"Se registraron {exitos} asientos contables en la Base de Datos.")
-            st.balloons()
+            st.toast("Asiento registrado exitosamente", icon="✅")
         for error in errores:
             st.error(f"No se pudo registrar: {error}")
         time.sleep(1.5)
@@ -654,14 +697,14 @@ def _cargar_lottie(url: str, ruta_local: str):
 # 1. CONFIGURACIÓN DE LA PÁGINA (Debe ser la primera línea de código)
 
 st.set_page_config(
-    page_title="Ledgerix | Sistema Contable",
+    page_title="Ledgex 7 | Sistema Contable",
     page_icon=":material/account_balance:",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
 # 2. BARRA LATERAL (NAVEGACIÓN CORPORATIVA)
-st.sidebar.title("Ledgerix")
+st.sidebar.title("Ledgex 7")
 st.sidebar.markdown("---")
 with st.sidebar:
     seleccion = option_menu(
@@ -687,7 +730,139 @@ with st.sidebar:
         },
     )
 st.sidebar.markdown("---")
-st.sidebar.caption("Ledgerix SaaS - Versión 1.0")
+st.sidebar.caption("Ledgex 7 (LX7) - Versión 1.0")
+
+# ============================================================================
+# 2-ter. CAPA VISUAL GLOBAL (Fintech Dark Mode + sello LX7)
+# ============================================================================
+# Solo presentacion: no toca datos ni logica. Se inyecta en cada rerun para que
+# aplique a todas las paginas. El sello va DESPUES de </style> y todo en columna 0
+# para que Markdown no lo interprete como bloque de codigo.
+_LX7_ESTILO_GLOBAL = """<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+:root {
+    --lx-bg: #0b0f19;
+    --lx-surface: #121a2c;
+    --lx-border: rgba(148,163,184,0.16);
+    --lx-border-strong: rgba(148,163,184,0.30);
+    --lx-text: #E6EDF7;
+    --lx-muted: #94A3B8;
+    --lx-cyan: #22D3EE;
+    --lx-emerald: #10B981;
+    --lx-radius: 12px;
+}
+html, body, .stApp, .stMarkdown, .stMarkdown p, label, button, input, textarea, h1, h2, h3, h4 {
+    font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
+}
+.stApp { background: var(--lx-bg); color: var(--lx-text); }
+[data-testid="stHeader"] { background: transparent; }
+.stApp h1, .stApp h2, .stApp h3 { color: #F8FAFC; letter-spacing: -0.02em; font-weight: 700; }
+.stApp h1 { font-weight: 800; letter-spacing: -0.03em; }
+.stApp hr { border-color: var(--lx-border); }
+/* ----- Barra lateral ----- */
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #0f1729 0%, #0b1120 100%);
+    border-right: 1px solid var(--lx-border);
+}
+[data-testid="stSidebarContent"] { background: transparent; }
+[data-testid="stSidebar"] h1 { font-size: 1.5rem; font-weight: 800; letter-spacing: -0.03em; color: #F8FAFC; }
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] { color: var(--lx-muted); letter-spacing: .04em; }
+/* ----- Contenedores con borde, metricas, expanders, tablas ----- */
+div[data-testid="stVerticalBlockBorderWrapper"] { border-color: var(--lx-border-strong); border-radius: var(--lx-radius); }
+[data-testid="stMetric"] {
+    position: relative; overflow: hidden;
+    background: var(--lx-surface); border: 1px solid var(--lx-border);
+    border-radius: var(--lx-radius); padding: 14px 18px 14px 22px;
+    transition: border-color .2s ease;
+}
+[data-testid="stMetric"]::before {
+    content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+    background: linear-gradient(180deg, var(--lx-cyan), var(--lx-emerald));
+}
+[data-testid="stMetric"]:hover { border-color: rgba(34,211,238,0.45); }
+[data-testid="stMetricLabel"], [data-testid="stMetricLabel"] p {
+    color: var(--lx-muted); text-transform: uppercase; letter-spacing: .08em; font-size: .72rem;
+}
+[data-testid="stMetricValue"] {
+    font-weight: 700; letter-spacing: -0.02em; font-variant-numeric: tabular-nums;
+    font-size: clamp(1.4rem, 2.2vw, 2.25rem);
+}
+[data-testid="stExpander"] details {
+    border: 1px solid var(--lx-border); border-radius: var(--lx-radius); background: var(--lx-surface);
+}
+[data-testid="stDataFrame"] { border: 1px solid var(--lx-border); border-radius: 10px; }
+/* Scroll nativo: ninguna tabla ni contenedor debe atrapar la rueda del mouse */
+[data-testid="stDataFrame"] .dvn-scroller, [data-testid="stDataFrameResizable"] .dvn-scroller { overscroll-behavior: auto !important; }
+[data-testid="stMain"], section.stMain { overflow-y: auto; }
+[data-testid="stMainBlockContainer"], .block-container { overflow: visible; height: auto; }
+[data-testid="stExpanderDetails"], [data-testid="stForm"] { overflow: visible; }
+[data-testid="stAlert"] { border-radius: var(--lx-radius); border: 1px solid var(--lx-border); }
+/* ----- Botones ----- */
+.stButton > button, .stDownloadButton > button, [data-testid="stFormSubmitButton"] > button {
+    border-radius: 10px; border: 1px solid var(--lx-border-strong);
+    background: var(--lx-surface); color: var(--lx-text);
+    font-weight: 600; letter-spacing: .01em;
+    transition: border-color .18s ease, background .18s ease, box-shadow .18s ease, filter .18s ease;
+}
+.stButton > button:hover, .stDownloadButton > button:hover, [data-testid="stFormSubmitButton"] > button:hover {
+    border-color: var(--lx-cyan); background: rgba(34,211,238,0.08); color: #FFFFFF;
+}
+button[kind="primary"], button[data-testid="stBaseButton-primary"] {
+    background: linear-gradient(90deg, #10B981, #22D3EE); border: none; color: #04121c;
+    box-shadow: 0 6px 18px rgba(16,185,129,0.25);
+}
+button[kind="primary"] p, button[data-testid="stBaseButton-primary"] p { color: #04121c; font-weight: 700; }
+button[kind="primary"]:hover, button[data-testid="stBaseButton-primary"]:hover {
+    filter: brightness(1.08); box-shadow: 0 10px 26px rgba(34,211,238,0.35);
+}
+/* ----- Campos de entrada ----- */
+[data-baseweb="input"], [data-baseweb="textarea"], [data-baseweb="select"] > div {
+    border-radius: 10px; border-color: var(--lx-border);
+}
+[data-baseweb="input"]:focus-within, [data-baseweb="textarea"]:focus-within, [data-baseweb="select"] > div:focus-within {
+    border-color: var(--lx-cyan); box-shadow: 0 0 0 1px rgba(34,211,238,0.35);
+}
+/* ----- Pestañas ----- */
+[data-baseweb="tab-list"] { gap: 6px; border-bottom: 1px solid var(--lx-border); }
+button[data-baseweb="tab"] { font-weight: 600; letter-spacing: .01em; }
+[data-baseweb="tab-highlight"] { background-color: var(--lx-cyan); height: 2px; }
+/* ----- Barras de desplazamiento ----- */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #1f2a44; border-radius: 8px; border: 2px solid var(--lx-bg); }
+/* ----- Barra superior: sin Deploy, para dejar sitio al sello ----- */
+[data-testid="stAppDeployButton"], .stAppDeployButton { display: none !important; }
+/* ----- Sello flotante LX7 ----- */
+div[data-testid="stElementContainer"]:has(.lx7-seal), div.element-container:has(.lx7-seal) {
+    display: contents !important;
+}
+.lx7-seal {
+    position: fixed; top: 15px; right: 4rem; z-index: 1000100;
+    display: inline-flex; align-items: center; gap: 8px;
+    height: 30px; padding: 0 9px 0 11px; border-radius: 8px;
+    border: 1px solid rgba(34,211,238,0.38);
+    background: rgba(11,15,25,0.78);
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    box-shadow: 0 6px 18px rgba(0,0,0,0.35), inset 0 0 12px rgba(34,211,238,0.06);
+    font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
+    font-size: .78rem; font-weight: 800; line-height: 1; letter-spacing: .16em;
+    color: #E6EDF7; pointer-events: none; user-select: none;
+}
+.lx7-seal::before {
+    content: ""; width: 6px; height: 6px; border-radius: 50%;
+    background: var(--lx-emerald); box-shadow: 0 0 8px var(--lx-emerald);
+    animation: lx7-dot 2.4s ease-in-out infinite;
+}
+.lx7-seal b {
+    font-weight: 800;
+    background: linear-gradient(90deg, #22D3EE, #10B981);
+    -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+}
+@keyframes lx7-dot { 0%, 100% { opacity: .55; transform: scale(.85); } 50% { opacity: 1; transform: scale(1.1); } }
+@media (prefers-reduced-motion: reduce) { .lx7-seal::before { animation: none; } }
+</style>
+<div class="lx7-seal" role="img" aria-label="Ledgex 7">LX<b>7</b></div>"""
+st.markdown(_LX7_ESTILO_GLOBAL, unsafe_allow_html=True)
 
 # ============================================================================
 # 2-bis. ARRANQUE: QUE LA BASE DE DATOS EXISTA Y ESTE LISTA
@@ -753,7 +928,7 @@ except Exception as _error_bd:  # noqa: BLE001 - la app no debe morir por un pro
 if _resultado_bd["estado"] == bd.ERROR_ACCESO:
     # Sin acceso a la base ninguna pagina funciona: se dice claro y se detiene el
     # render en vez de dejar que cada consulta reviente con su propio traceback.
-    st.error(f"Ledgerix no puede trabajar con la base de datos.\n\n{_resultado_bd['detalle']}")
+    st.error(f"Ledgex 7 no puede trabajar con la base de datos.\n\n{_resultado_bd['detalle']}")
     st.code(_resultado_bd["ruta"], language=None)
     st.stop()
 elif _resultado_bd["estado"] == bd.INCONSISTENTE:
@@ -872,7 +1047,7 @@ if menu == "Inicio":
             min-height: 3.5rem; padding: .9rem 1.5rem;
             box-shadow: 0 10px 30px rgba(16,185,129,0.30);
             transition: transform .18s ease, box-shadow .18s ease, filter .18s ease;
-            animation: lx-pulse 2.6s ease-out 2.3s infinite;
+            animation: lx-pulse 2.2s ease-out 2.3s infinite;
         }
         .st-key-cta_principal button p, .st-key-cta_principal button div {
             color: #0b0f19 !important; font-weight: 700 !important; font-size: 1.15rem !important;
@@ -927,6 +1102,47 @@ if menu == "Inicio":
             content: ""; display: block; width: 56px; height: 2px; margin: 0 auto 20px auto;
             border-radius: 2px; background: linear-gradient(90deg, #10B981, #22D3EE);
         }
+        /* ===== LX7: refinamientos Fintech de la portada ===== */
+        .lx-brand-7 {
+            margin-left: .06em;
+            background: linear-gradient(180deg, #67E8F9 0%, #10B981 100%);
+            -webkit-background-clip: text; background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .lx-tag { max-width: 860px; color: #A8B5CA; text-wrap: balance; }
+        .lx-step {
+            position: relative; overflow: hidden;
+            transition: border-color .25s ease, box-shadow .25s ease, translate .25s ease, background .25s ease;
+        }
+        .lx-step::before {
+            content: ""; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+            background: linear-gradient(90deg, transparent, #22D3EE, transparent); opacity: .55;
+        }
+        .lx-step:hover {
+            translate: 0 -4px; border-color: rgba(34,211,238,0.55);
+            background: rgba(34,211,238,0.05); box-shadow: 0 14px 34px rgba(0,0,0,0.35);
+        }
+        .lx-pillar { transition: border-color .2s ease, background .2s ease, translate .2s ease; }
+        .lx-pillar:hover { border-color: rgba(34,211,238,0.5); background: rgba(34,211,238,0.05); translate: 4px 0; }
+        .lx-pillar-t { color: #F1F5F9; }
+        .lx-pillar-d { color: #94A3B8; opacity: 1; }
+        /* Indicador de scroll (chevrones animados) */
+        .lx-scroll {
+            display: flex; flex-direction: column; align-items: center;
+            margin-top: 2.4vh; color: #22D3EE;
+            animation: lx-rise .8s ease 2.1s both;
+        }
+        .lx-scroll-t {
+            font-size: .68rem; letter-spacing: .24em; text-transform: uppercase;
+            color: #64748B; font-weight: 600; margin-bottom: 4px;
+        }
+        .lx-chev { display: flex; line-height: 0; margin-top: -9px; animation: lx-chev 1.8s ease-in-out infinite; }
+        .lx-chev + .lx-chev { animation-delay: .22s; }
+        @keyframes lx-chev {
+            0%   { opacity: 0; transform: translateY(-6px); }
+            45%  { opacity: 1; }
+            100% { opacity: 0; transform: translateY(8px); }
+        }
         /* Gráfico SVG animado (respaldo si no carga el Lottie) */
         .lx-chart { display: flex; align-items: center; justify-content: center; min-height: 240px; color: #22D3EE; }
         .lx-bar {
@@ -937,8 +1153,8 @@ if menu == "Inicio":
         @keyframes lx-flow  { to { stroke-dashoffset: -16; } }
         @keyframes lx-grow  { from { transform: scaleY(.35); } to { transform: scaleY(1); } }
         @keyframes lx-pulse {
-            0%   { box-shadow: 0 10px 30px rgba(16,185,129,0.30), 0 0 0 0 rgba(34,211,238,0.45); }
-            70%  { box-shadow: 0 10px 30px rgba(16,185,129,0.30), 0 0 0 16px rgba(34,211,238,0); }
+            0%   { box-shadow: 0 10px 30px rgba(16,185,129,0.30), 0 0 0 0 rgba(34,211,238,0.55); }
+            70%  { box-shadow: 0 10px 34px rgba(34,211,238,0.38), 0 0 0 22px rgba(34,211,238,0); }
             100% { box-shadow: 0 10px 30px rgba(16,185,129,0.30), 0 0 0 0 rgba(34,211,238,0); }
         }
         /* Las reglas responsivas del hero se miden contra su propio ancho (no el de la ventana),
@@ -962,6 +1178,7 @@ if menu == "Inicio":
         }
         @media (prefers-reduced-motion: reduce) {
             .lx-brand, .lx-tag, .lx-how, .lx-step, .lx-conn, .lx-dash, .lx-bar,
+            .lx-scroll, .lx-chev,
             .st-key-cta_principal, .st-key-cta_principal button, .st-key-cta_secundario { animation: none !important; }
         }
     </style>
@@ -970,15 +1187,15 @@ if menu == "Inicio":
     # ---------- HERO: logo -> pasos -> botón ----------
     with st.container(key="lx_hero"):
         st.markdown(f"""
-        <div class="lx-brand">Ledgerix</div>
-        <div class="lx-tag">El motor de inteligencia artificial para la gestión financiera y contable.</div>
+        <div class="lx-brand">Ledgex <span class="lx-brand-7">7</span></div>
+        <div class="lx-tag">De la captura del dato al Estado Financiero en segundos con IA.</div>
         <div class="lx-how">Cómo funciona</div>
         <div class="lx-steps">
             <div class="lx-step" style="animation-delay:.6s">
                 <div class="lx-step-ico">{ICO_SUBIR}</div>
                 <div class="lx-step-n">Paso 1</div>
-                <div class="lx-step-t">Captura de Datos (IA o Manual)</div>
-                <div class="lx-step-h">Texto, PDF, imagen o voz</div>
+                <div class="lx-step-t">Captura Unificada de Datos</div>
+                <div class="lx-step-h">Texto, documento, voz o imagen</div>
             </div>
             <div class="lx-conn" style="animation-delay:.75s">{CONECTOR}</div>
             <div class="lx-step" style="animation-delay:.9s">
@@ -1004,8 +1221,14 @@ if menu == "Inicio":
             st.button("Ver Dashboard Gerencial", key="cta_secundario",
                       use_container_width=True, on_click=_ir_a_con_pista, args=("Dashboard Gerencial",))
 
+        _chev = _svg('<polyline points="6 9 12 15 18 9"/>', 26)
+        st.markdown(
+            f'<div class="lx-scroll" aria-hidden="true"><span class="lx-scroll-t">Desplázate</span>'
+            f'<span class="lx-chev">{_chev}</span><span class="lx-chev">{_chev}</span></div>',
+            unsafe_allow_html=True)
+
     # ---------- Propuesta de valor: Lottie + 3 frases de una línea ----------
-    st.markdown('<div class="lx-section">Por qué Ledgerix</div>', unsafe_allow_html=True)
+    st.markdown('<div class="lx-section">Por qué Ledgex 7</div>', unsafe_allow_html=True)
 
     GRAFICO_ANIMADO = """
     <div class="lx-chart">
@@ -1062,13 +1285,109 @@ if menu == "Inicio":
 
 elif menu == "Registro de Transacciones":
     st.title("Registro de Transacciones")
-    st.markdown("Ingresa nuevos asientos contables mediante captura manual o el Asistente IA.")
+    st.markdown("Captura asientos desde texto, documentos, voz o imágenes. Todo pasa por el borrador de revisión antes de guardarse.")
 
-    # Redujimos las pestañas a 2: Manual y el Motor Central IA
-    tab_manual, tab_ia = st.tabs(["Ingreso Manual", "Asistente IA (Gemini)"])
+    st.markdown("""
+    <style>
+        /* ===== Registro: centro de captura unificado ===== */
+        .st-key-lx_composer {
+            background: linear-gradient(180deg, rgba(20,29,49,0.92) 0%, rgba(13,19,33,0.92) 100%);
+            border: 1px solid rgba(148,163,184,0.18); border-radius: 18px;
+            padding: 20px 22px 22px 22px;
+            box-shadow: 0 18px 50px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.04);
+        }
+        .lx-cap-head { font-size: 1.25rem; font-weight: 700; letter-spacing: -0.01em; color: #F8FAFC; margin: 0 0 2px 0; }
+        .lx-cap-head::before {
+            content: ""; display: inline-block; width: 8px; height: 8px; margin-right: 10px;
+            border-radius: 2px; background: linear-gradient(135deg, #22D3EE, #10B981); vertical-align: middle;
+        }
+        .st-key-lx_composer hr { margin: 1rem 0 1.2rem 0; border-color: rgba(148,163,184,0.14); }
+        /* ----- Barra de herramientas (st.radio redibujado como segmentos) ----- */
+        .st-key-lx_tool [role="radiogroup"] {
+            display: flex; flex-wrap: wrap; gap: 6px; width: fit-content; padding: 5px;
+            background: rgba(8,12,22,0.7); border: 1px solid rgba(148,163,184,0.16); border-radius: 14px;
+        }
+        .st-key-lx_tool label[data-baseweb="radio"] {
+            margin: 0; padding: 8px 16px 8px 12px; border-radius: 10px; cursor: pointer;
+            display: flex; align-items: center; gap: 8px; color: #94A3B8;
+            transition: background .18s ease, color .18s ease, box-shadow .18s ease;
+        }
+        .st-key-lx_tool label[data-baseweb="radio"] > div:first-child { display: none; }
+        .st-key-lx_tool label[data-baseweb="radio"] div { color: inherit !important; }
+        .st-key-lx_tool label[data-baseweb="radio"] p { color: inherit; margin: 0; font-weight: 600; font-size: .92rem; }
+        .st-key-lx_tool label[data-baseweb="radio"]:hover { background: rgba(34,211,238,0.08); color: #E6EDF7; }
+        .st-key-lx_tool label[data-baseweb="radio"]:has(input:checked) {
+            background: linear-gradient(135deg, rgba(34,211,238,0.18), rgba(16,185,129,0.16));
+            color: #F8FAFC; box-shadow: inset 0 0 0 1px rgba(34,211,238,0.45);
+        }
+        .st-key-lx_tool label[data-baseweb="radio"]::before {
+            content: ""; flex: 0 0 17px; width: 17px; height: 17px; background-color: currentColor;
+            -webkit-mask-repeat: no-repeat; mask-repeat: no-repeat;
+            -webkit-mask-position: center; mask-position: center;
+            -webkit-mask-size: contain; mask-size: contain;
+        }
+        .st-key-lx_tool label[data-baseweb="radio"]:has(input:checked)::before { background-color: #22D3EE; }
+        .st-key-lx_tool label[data-baseweb="radio"]:nth-child(1)::before {
+            -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='4 7 4 4 20 4 20 7'/%3E%3Cline x1='9' y1='20' x2='15' y2='20'/%3E%3Cline x1='12' y1='4' x2='12' y2='20'/%3E%3C/svg%3E");
+            mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='4 7 4 4 20 4 20 7'/%3E%3Cline x1='9' y1='20' x2='15' y2='20'/%3E%3Cline x1='12' y1='4' x2='12' y2='20'/%3E%3C/svg%3E");
+        }
+        .st-key-lx_tool label[data-baseweb="radio"]:nth-child(2)::before {
+            -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z'/%3E%3Cpolyline points='14 2 14 8 20 8'/%3E%3C/svg%3E");
+            mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z'/%3E%3Cpolyline points='14 2 14 8 20 8'/%3E%3C/svg%3E");
+        }
+        .st-key-lx_tool label[data-baseweb="radio"]:nth-child(3)::before {
+            -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z'/%3E%3Cpath d='M19 10v2a7 7 0 0 1-14 0v-2'/%3E%3Cline x1='12' y1='19' x2='12' y2='23'/%3E%3C/svg%3E");
+            mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z'/%3E%3Cpath d='M19 10v2a7 7 0 0 1-14 0v-2'/%3E%3Cline x1='12' y1='19' x2='12' y2='23'/%3E%3C/svg%3E");
+        }
+        .st-key-lx_tool label[data-baseweb="radio"]:nth-child(4)::before {
+            -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z'/%3E%3Ccircle cx='12' cy='12' r='3'/%3E%3C/svg%3E");
+            mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z'/%3E%3Ccircle cx='12' cy='12' r='3'/%3E%3C/svg%3E");
+        }
+        /* ----- Zona de carga de archivos y texto ----- */
+        .st-key-lx_composer [data-testid="stFileUploaderDropzone"] {
+            border: 1.5px dashed rgba(34,211,238,0.35); border-radius: 14px;
+            background: rgba(34,211,238,0.03); transition: border-color .2s ease, background .2s ease;
+        }
+        .st-key-lx_composer [data-testid="stFileUploaderDropzone"]:hover {
+            border-color: #22D3EE; background: rgba(34,211,238,0.07);
+        }
+        .st-key-lx_composer textarea { border-radius: 14px; }
+        /* ----- Zona de Grabacion Activa ----- */
+        .st-key-lx_voz_zona {
+            border: 1.5px dashed rgba(34,211,238,0.45); border-radius: 16px; padding: 14px 16px 16px 16px;
+            background: radial-gradient(ellipse at 50% 0%, rgba(34,211,238,0.10), transparent 70%), rgba(8,12,22,0.55);
+            animation: lx-rec-glow 3s ease-in-out infinite;
+        }
+        .lx-rec {
+            display: flex; align-items: center; gap: 10px; margin-bottom: 8px;
+            font-size: .78rem; font-weight: 700; letter-spacing: .16em; text-transform: uppercase; color: #A5F3FC;
+        }
+        .lx-rec-dot { width: 9px; height: 9px; border-radius: 50%; background: #F43F5E; animation: lx-rec-dot 1.6s ease-out infinite; }
+        .st-key-lx_voz_zona [data-testid="stAudioInput"] { border-radius: 12px; }
+        @keyframes lx-rec-dot {
+            0%   { box-shadow: 0 0 0 0 rgba(244,63,94,0.55); }
+            70%  { box-shadow: 0 0 0 10px rgba(244,63,94,0); }
+            100% { box-shadow: 0 0 0 0 rgba(244,63,94,0); }
+        }
+        @keyframes lx-rec-glow {
+            0%, 100% { box-shadow: 0 0 0 rgba(34,211,238,0); }
+            50%      { box-shadow: 0 0 28px rgba(34,211,238,0.14); }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            .st-key-lx_voz_zona, .lx-rec-dot { animation: none !important; }
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # Centro de captura unico (barra de herramientas) + ingreso manual como panel desplegable
+    # El orden de CREACION de los contenedores fija el orden en pantalla: primero la
+    # barra de captura, despues el ingreso manual. Los bloques `with tab_manual:` y
+    # `with tab_ia:` siguientes no cambian.
+    tab_ia = st.container(key="lx_composer")
+    tab_manual = st.expander("Ingreso manual de partida doble", expanded=False)
 
     with tab_manual:
-        st.subheader("Ingreso Manual de Asientos")
+        # (el titulo lo aporta el expander)
         st.info("Captura el asiento y envíalo al borrador. Allí lo apruebas y recién "
                 "entonces se guarda en la base de datos.")
 
@@ -1127,12 +1446,20 @@ elif menu == "Registro de Transacciones":
                     st.rerun()
 
     with tab_ia:
-        st.subheader("Asistente IA Contable (Gemini)")
-        st.markdown("La Inteligencia Artificial analizará el contexto, identificará las cuentas del PCGE y calculará la partida doble automáticamente.")
+        st.markdown('<div class="lx-cap-head">Centro de captura</div>', unsafe_allow_html=True)
+        st.caption("Cada captura se suma al borrador: puedes combinar texto, documentos, voz e imágenes y revisarlo todo junto antes de guardar. La IA identifica las cuentas del PCGE y calcula la partida doble.")
 
         ia_metodo = st.radio(
             "Selecciona el método de captura:",
             ["Enunciado de Texto", "Carga de Documentos (Excel, PDF, Word)", "Dictado por Voz", "Escáner Visual"],
+            key="lx_tool",
+            format_func=lambda m: {
+                "Enunciado de Texto": "Texto",
+                "Carga de Documentos (Excel, PDF, Word)": "Documento",
+                "Dictado por Voz": "Voz",
+                "Escáner Visual": "Visión",
+            }[m],
+            label_visibility="collapsed",
             horizontal=True
         )
         st.markdown("---")
@@ -1257,7 +1584,10 @@ elif menu == "Registro de Transacciones":
         elif ia_metodo == "Dictado por Voz":
             st.markdown("**Reconocimiento de Voz a Texto (Groq Whisper)**")
             st.info("Graba tu dictado con el micrófono. El audio se transcribirá usando Groq y el texto resultante podrá revisarse antes de generar el asiento.")
-            audio_grabado = st.audio_input("Grabar audio")
+            with st.container(key="lx_voz_zona"):
+                st.markdown('<div class="lx-rec"><span class="lx-rec-dot"></span>Zona de Grabación Activa</div>',
+                            unsafe_allow_html=True)
+                audio_grabado = st.audio_input("Grabar audio")
             if audio_grabado is not None:
                 st.audio(audio_grabado, format="audio/wav")
                 if st.button("Transcribir audio con Groq", type="secondary", use_container_width=True):
@@ -1381,15 +1711,53 @@ elif menu == "Registro de Transacciones":
     # validacion -> aprobacion -> base de datos.
     origen_borrador = st.session_state.get("origen_borrador")
     if st.session_state.get("borrador_ia"):
-        if st.session_state.get("resumen_borrador"):
-            st.caption(st.session_state["resumen_borrador"])
-        for aviso in st.session_state.get("avisos_borrador", []):
+        if st.session_state.get("resumen_borrador") or st.session_state.get("_resumen_hist"):
+            for _resumen in list(st.session_state.get("_resumen_hist", [])) + [st.session_state.get("resumen_borrador")]:
+                if _resumen:
+                    st.caption(_resumen)
+        st.button("Vaciar borrador", key="lx_vaciar_borrador", on_click=_vaciar_borrador,
+                  help="Descarta todos los asientos pendientes de revisión. No modifica la base de datos.")
+        for aviso in list(st.session_state.get("_avisos_hist", [])) + list(st.session_state.get("avisos_borrador") or []):
             st.warning(f"{aviso}")
         render_borrador(origen_borrador or "documento")
 
 elif menu == "Libros Contables":
     st.title("Libros Contables")
     st.markdown("Registros formales de las operaciones, base para la elaboración de los Estados Financieros.")
+
+    st.markdown("""
+    <style>
+        /* ===== Libros: panel de control vs reporte ===== */
+        [class*="st-key-lx_panel_"] {
+            background: linear-gradient(180deg, rgba(23,32,54,0.95), rgba(15,22,38,0.95));
+            border: 1px solid rgba(34,211,238,0.22); border-left: 4px solid #22D3EE;
+            border-radius: 14px; padding: 16px 20px 14px 20px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+        }
+        .lx-panel-t, .lx-report-t {
+            font-size: .72rem; font-weight: 700; letter-spacing: .2em; text-transform: uppercase;
+        }
+        .lx-panel-t { color: #22D3EE; margin-bottom: 2px; }
+        .lx-report-t { display: flex; align-items: center; gap: 14px; color: #10B981; margin: 26px 0 10px 0; }
+        .lx-report-t::after {
+            content: ""; flex: 1; height: 1px;
+            background: linear-gradient(90deg, rgba(16,185,129,0.55), transparent);
+        }
+        /* Tarjetas de lectura: cada asiento (Diario) y cada cuenta (Mayor) */
+        [class*="st-key-lx_asiento_"], [class*="st-key-lx_cuenta_"] {
+            border: 1px solid rgba(148,163,184,0.16); border-radius: 12px;
+            padding: 14px 18px 16px 18px;
+        }
+        [class*="st-key-lx_asiento_"] {
+            border-left: 4px solid #22D3EE;
+            background: linear-gradient(90deg, rgba(34,211,238,0.07), rgba(34,211,238,0) 45%);
+        }
+        [class*="st-key-lx_cuenta_"] {
+            border-left: 4px solid #10B981;
+            background: linear-gradient(90deg, rgba(16,185,129,0.08), rgba(16,185,129,0) 45%);
+        }
+    </style>
+    """, unsafe_allow_html=True)
 
     # ------------------------------------------------------------------
     # Fuente de datos: la base de datos real. Los libros son consultas de SOLO
@@ -1455,7 +1823,8 @@ elif menu == "Libros Contables":
         kpi_diario = st.container()
 
         if _hay_asientos:
-            with st.container(border=True):
+            with st.container(key="lx_panel_diario"):
+                st.markdown('<div class="lx-panel-t">Panel de control</div>', unsafe_allow_html=True)
                 st.markdown("**Filtros de consulta**")
                 f1, f2, f3 = st.columns([2, 2, 3])
                 with f1:
@@ -1466,6 +1835,7 @@ elif menu == "Libros Contables":
                 with f3:
                     glosa_d = st.text_input("Buscar en glosa", placeholder="Palabra clave de la operación",
                                             key="lc_diario_glosa")
+                _slot_export_d = st.container()
 
             desde_d, hasta_d = _periodo(rango_d)
             df_diario = _presentar(
@@ -1480,6 +1850,7 @@ elif menu == "Libros Contables":
             # que es lo que espera el generador: por eso el contexto se arma con
             # `(x or "")`, y no con `.strip()` sobre un valor que puede ser None.
             desde_d = hasta_d = cuenta_d = glosa_d = None
+            _slot_export_d = st.container()
             df_diario = pd.DataFrame(columns=_COLS_DIARIO)
             st.info("Todavía no hay asientos registrados. El Libro Diario se alimenta de los asientos "
                     "aprobados desde 'Registro de Transacciones'.")
@@ -1515,7 +1886,7 @@ help="Control de cuadre del conjunto filtrado: al ser cero, el Debe y el Haber "
                 "total_partidas": int(len(df_diario)),
             },
         )
-        st.download_button(
+        _slot_export_d.download_button(
             "Exportar PDF",
             data=_pdf_diario,
             file_name=f"libro_diario_{_sufijo_periodo(desde_d, hasta_d)}.pdf",
@@ -1529,6 +1900,7 @@ help="Control de cuadre del conjunto filtrado: al ser cero, el Debe y el Haber "
         # Asientos, o sea que son UNA por asiento y se repiten en cada una de sus
         # partidas: se muestran una sola vez en el encabezado y la tabla interna deja
         # de repetirlas, dejando solo el detalle contable del asiento.
+        st.markdown('<div class="lx-report-t">Reporte</div>', unsafe_allow_html=True)
         if df_diario.empty:
             with st.container(border=True):
                 st.caption("No se encontraron registros con los filtros aplicados.")
@@ -1538,9 +1910,9 @@ help="Control de cuadre del conjunto filtrado: al ser cero, el Debe y el Haber "
             _diario_ordenado = df_diario.sort_values(["Fecha", "N° Asiento"], kind="stable")
             for _numero_asiento, _partidas in _diario_ordenado.groupby("N° Asiento", sort=True):
                 _cabecera = _partidas.iloc[0]
-                with st.container(border=True):
+                with st.container(key=f"lx_asiento_{_numero_asiento}"):
                     st.markdown(
-                        f"**Asiento #{_numero_asiento}** "
+                        f":blue-background[ASIENTO N° {_numero_asiento}] "
                         f"| {_fecha_texto(_cabecera['Fecha'])} "
                         f"| {_cabecera['Glosa']}"
                     )
@@ -1574,7 +1946,8 @@ help="Control de cuadre del conjunto filtrado: al ser cero, el Debe y el Haber "
                 f"{c} - {d}" for c, d in zip(_cuentas_disponibles["codigo"], _cuentas_disponibles["descripcion"])
             ]
 
-            with st.container(border=True):
+            with st.container(key="lx_panel_mayor"):
+                st.markdown('<div class="lx-panel-t">Panel de control</div>', unsafe_allow_html=True)
                 st.markdown("**Selección de cuenta**")
                 s1, s2 = st.columns([3, 2])
                 with s1:
@@ -1584,6 +1957,7 @@ help="Control de cuadre del conjunto filtrado: al ser cero, el Debe y el Haber "
                 with s2:
                     rango_m = st.date_input("Periodo", value=(_fecha_min, _fecha_max),
                                             format="DD/MM/YYYY", key="lc_mayor_periodo")
+                _slot_export_m = st.container()
 
             desde_m, hasta_m = _periodo(rango_m)
             codigo_m = None if cuenta_m == "Todas las cuentas" else cuenta_m.split(" - ", 1)[0]
@@ -1596,6 +1970,7 @@ help="Control de cuadre del conjunto filtrado: al ser cero, el Debe y el Haber "
                     _naturaleza_m = _ficha["naturaleza"].iloc[0]
         else:
             cuenta_m, codigo_m = "Todas las cuentas", None
+            _slot_export_m = st.container()
             desde_m = hasta_m = _naturaleza_m = None
             df_mayor = pd.DataFrame(columns=_COLS_MAYOR)
             st.info("Todavía no hay asientos registrados, así que el Libro Mayor no tiene movimientos "
@@ -1633,7 +2008,7 @@ help="Control de cuadre del conjunto filtrado: al ser cero, el Debe y el Haber "
         _nombre_mayor = f"libro_mayor_{_sufijo_periodo(desde_m, hasta_m)}"
         if codigo_m is not None:
             _nombre_mayor += f"_cuenta_{codigo_m}"
-        st.download_button(
+        _slot_export_m.download_button(
             "Exportar PDF",
             data=_pdf_mayor,
             file_name=f"{_nombre_mayor}.pdf",
@@ -1647,6 +2022,7 @@ help="Control de cuadre del conjunto filtrado: al ser cero, el Debe y el Haber "
         # cuenta, asi que van en el encabezado. En cambio la fecha, el numero de asiento
         # y la glosa SI se conservan en la tabla: son el detalle del movimiento, y el
         # saldo acumulado solo tiene sentido avanzando dentro de una misma cuenta.
+        st.markdown('<div class="lx-report-t">Reporte</div>', unsafe_allow_html=True)
         if df_mayor.empty:
             with st.container(border=True):
                 st.caption("No se encontraron registros con los filtros aplicados.")
@@ -1660,8 +2036,8 @@ help="Control de cuadre del conjunto filtrado: al ser cero, el Debe y el Haber "
             )
             for _codigo_cuenta, _movimientos in _mayor_ordenado.groupby("Cuenta PCGE", sort=True):
                 _denominacion_cuenta = _movimientos["Denominación"].iloc[0]
-                with st.container(border=True):
-                    st.markdown(f"**Cuenta PCGE: {_codigo_cuenta} — {_denominacion_cuenta}**")
+                with st.container(key=f"lx_cuenta_{_codigo_cuenta}"):
+                    st.markdown(f":green-background[CUENTA {_codigo_cuenta}] **{_denominacion_cuenta}**")
                     st.dataframe(
                         _movimientos[_COLS_DETALLE_M],
                         use_container_width=True,
@@ -1682,6 +2058,31 @@ help="Control de cuadre del conjunto filtrado: al ser cero, el Debe y el Haber "
 elif menu == "Estados Financieros":
     st.title("Estados Financieros")
     st.markdown("Reportes automáticos basados en el Plan Contable General Empresarial (PCGE).")
+
+    st.markdown("""
+    <style>
+        /* ===== Estados Financieros: subencabezados formales y estado vertical ===== */
+        .lx-grupo {
+            display: flex; align-items: center; gap: 10px; margin: 16px 0 6px 0;
+            font-size: .78rem; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; color: #22D3EE;
+        }
+        .lx-grupo::before {
+            content: ""; width: 3px; height: 14px; border-radius: 2px;
+            background: linear-gradient(180deg, #22D3EE, #10B981);
+        }
+        .lx-resultado {
+            max-width: 760px; margin: 18px 0 10px 0; overflow: hidden;
+            border: 1px solid rgba(148,163,184,0.28); border-radius: 14px;
+            background: rgba(18,26,44,0.9); font-variant-numeric: tabular-nums;
+        }
+        .lx-res-row { display: flex; justify-content: space-between; gap: 16px; padding: 12px 20px; color: #E6EDF7; }
+        .lx-res-row + .lx-res-row { border-top: 1px solid rgba(148,163,184,0.14); }
+        .lx-res-neg { color: #FB7185; background: rgba(244,63,94,0.06); }
+        .lx-res-total { font-weight: 800; font-size: 1.15rem; border-top: 1px solid rgba(34,211,238,0.45) !important; }
+        .lx-res-pos { color: #34D399; background: rgba(16,185,129,0.10); }
+        .lx-res-loss { color: #FB7185; background: rgba(244,63,94,0.10); }
+    </style>
+    """, unsafe_allow_html=True)
 
     # --- PERIODO DEL ESTADO ---
     # Aqui el periodo no es un filtro cosmetico: decide que cifras son correctas.
@@ -1750,17 +2151,33 @@ elif menu == "Estados Financieros":
 
             with col_activo:
                 st.markdown("### Activos")
-                st.dataframe(activos[['codigo', 'descripcion', 'saldo']].style.format({'saldo': 'S/ {:.2f}'}), hide_index=True, use_container_width=True)
+                # Mismo agrupamiento y mismas etiquetas que el PDF (lg.ETIQUETAS_ACTIVO).
+                if activos.empty:
+                    st.caption("Sin movimiento en el periodo")
+                for _e in sorted(activos['elemento'].unique()):
+                    _grupo = activos[activos['elemento'] == _e]
+                    _titulo_grupo = lg.ETIQUETAS_ACTIVO.get(int(_e), f"Activo {_e}")
+                    st.markdown(f'<div class="lx-grupo">{_titulo_grupo}</div>', unsafe_allow_html=True)
+                    st.dataframe(_grupo[['codigo', 'descripcion', 'saldo']].style.format({'saldo': 'S/ {:.2f}'}), hide_index=True, use_container_width=True)
+                    st.caption(f"Subtotal {_titulo_grupo}: S/ {_grupo['saldo'].sum():,.2f}")
                 st.success(f"**Total Activos: S/ {activos['saldo'].sum():,.2f}**")
 
             with col_pasivo:
                 st.markdown("### Pasivos y Patrimonio")
-                st.dataframe(pasivos_patrimonio[['codigo', 'descripcion', 'saldo']].style.format({'saldo': 'S/ {:.2f}'}), hide_index=True, use_container_width=True)
+                for _e, _titulo_pp in ((4, "Pasivo"), (5, "Patrimonio")):
+                    _grupo_pp = pasivos_patrimonio[pasivos_patrimonio['elemento'] == _e]
+                    st.markdown(f'<div class="lx-grupo">{_titulo_pp}</div>', unsafe_allow_html=True)
+                    if _grupo_pp.empty:
+                        st.caption("Sin movimiento en el periodo")
+                    else:
+                        st.dataframe(_grupo_pp[['codigo', 'descripcion', 'saldo']].style.format({'saldo': 'S/ {:.2f}'}), hide_index=True, use_container_width=True)
+                        st.caption(f"Subtotal {_titulo_pp}: S/ {_grupo_pp['saldo'].sum():,.2f}")
                 if resultado_acumulado != 0:
                     st.caption(f"*Resultado acumulado hasta {hasta_ee.strftime('%d/%m/%Y') if hasattr(hasta_ee,'strftime') else hasta_ee}: S/ {resultado_acumulado:,.2f}*")
 
                 total_p_y_p = pasivos_patrimonio['saldo'].sum() + resultado_acumulado
-                st.error(f"**Total Pasivo + Patrimonio: S/ {total_p_y_p:,.2f}**")
+                _cuadra = abs(float(activos['saldo'].sum()) - float(total_p_y_p)) < 0.005
+                (st.success if _cuadra else st.error)(f"**Total Pasivo + Patrimonio: S/ {total_p_y_p:,.2f}**")
 
             # El PDF se arma con `df_saldos`, el mismo DataFrame ya filtrado por
             # periodo que se esta mostrando, y con los subconjuntos que la pantalla
@@ -1827,7 +2244,9 @@ elif menu == "Estados Financieros":
             ingresos_df = df_saldos[df_saldos['elemento'] == 7]
             gastos_df = df_saldos[df_saldos['elemento'].isin([6, 9])]
 
-            col_ing, col_gas = st.columns(2)
+            # Estructura vertical escalonada: Ingresos, luego Gastos (deducciones), al final la Utilidad.
+            col_ing = st.container()
+            col_gas = st.container()
 
             with col_ing:
                 st.markdown("### Ingresos")
@@ -1836,14 +2255,22 @@ elif menu == "Estados Financieros":
                 st.success(f"**Total Ingresos: S/ {ingresos_tot_per:,.2f}**")
 
             with col_gas:
-                st.markdown("### Gastos")
+                st.markdown("### Gastos (deducciones)")
                 if not gastos_df.empty:
-                    st.dataframe(gastos_df[['codigo', 'descripcion', 'saldo']].style.format({'saldo': 'S/ {:.2f}'}), hide_index=True, use_container_width=True)
-                st.error(f"**Total Gastos: S/ {gastos_tot_per:,.2f}**")
+                    st.dataframe(gastos_df[['codigo', 'descripcion', 'saldo']].style.format({'saldo': '(S/ {:,.2f})'}).set_properties(subset=['saldo'], **{'color': '#FB7185'}), hide_index=True, use_container_width=True)
+                st.error(f"**(-) Total Gastos: S/ {gastos_tot_per:,.2f}**")
 
-            st.markdown("---")
+            _clase_res = "lx-res-pos" if resultado_periodo >= 0 else "lx-res-loss"
+            _etq_res = "UTILIDAD DEL EJERCICIO" if resultado_periodo >= 0 else "PÉRDIDA DEL EJERCICIO"
+            st.markdown(
+                f'<div class="lx-resultado">'
+                f'<div class="lx-res-row"><span>Total Ingresos</span><span>S/ {ingresos_tot_per:,.2f}</span></div>'
+                f'<div class="lx-res-row lx-res-neg"><span>(-) Total Gastos</span><span>(S/ {gastos_tot_per:,.2f})</span></div>'
+                f'<div class="lx-res-row lx-res-total {_clase_res}"><span>{_etq_res}</span><span>S/ {resultado_periodo:,.2f}</span></div>'
+                f'</div>',
+                unsafe_allow_html=True)
             color_utilidad = "normal" if resultado_periodo >= 0 else "inverse"
-            st.metric(label="RESULTADO DEL EJERCICIO (Utilidad / Pérdida)", value=f"S/ {resultado_periodo:,.2f}", delta_color=color_utilidad)
+            # (el resultado del ejercicio se muestra arriba, al pie del estado vertical)
 
             _pdf_resultados = reportes_pdf.generar_pdf_estado_resultados(
                 df_saldos,
@@ -1883,6 +2310,10 @@ elif menu == "Dashboard Gerencial":
     # tarjetas se pintan en cero, que es el valor neutro que corresponde, en vez de
     # dejar la cuarta sin valor definido y reventar la pagina con un NameError.
     utilidad_dashboard = 0.0
+    # Ingresos (elemento 7) y gastos (elementos 6 y 9) arrancan en cero para que los
+    # graficos y ratios de abajo tengan siempre un valor definido, incluso sin datos.
+    ingresos = 0.0
+    gastos = 0.0
 
     if not df_saldos.empty:
         # Filtramos matemáticamente usando el campo 'elemento' del PCGE
@@ -1893,6 +2324,14 @@ elif menu == "Dashboard Gerencial":
         ingresos = df_saldos[df_saldos['elemento'] == 7]['saldo'].sum()
         gastos = df_saldos[df_saldos['elemento'].isin([6, 9])]['saldo'].sum()
         utilidad_dashboard = ingresos - gastos
+    # Normalizamos a float nativo (los .sum() de pandas devuelven tipos numpy)
+    total_activos = float(total_activos)
+    total_pasivos = float(total_pasivos)
+    total_patrimonio = float(total_patrimonio)
+    utilidad_dashboard = float(utilidad_dashboard)
+    ingresos = float(ingresos)
+    gastos = float(gastos)
+
     # Tarjetas de Métricas (KPIs)
     col1, col2, col3, col4 = st.columns(4)
     col1.metric(label="Activos Totales", value=f"S/ {total_activos:,.2f}")
@@ -1900,15 +2339,93 @@ elif menu == "Dashboard Gerencial":
     col3.metric(label="Patrimonio", value=f"S/ {total_patrimonio:,.2f}")
     col4.metric(label="Utilidad del Ejercicio", value=f"S/ {utilidad_dashboard:,.2f}")
 
+    # KPIs ejecutivos: margen de utilidad y ratio de solvencia (con guardas de division por cero)
+    if ingresos > 0:
+        _margen_txt = f"{(utilidad_dashboard / ingresos) * 100:,.1f}%"
+    else:
+        _margen_txt = "N/A"
+
+    if total_pasivos > 0:
+        _solvencia_txt = f"{total_activos / total_pasivos:,.2f}x"
+    elif total_activos > 0:
+        # Sin obligaciones registradas, la solvencia es plena
+        _solvencia_txt = "Óptima"
+    else:
+        _solvencia_txt = "N/A"
+
+    kpi_a, kpi_b, _kpi_c, _kpi_d = st.columns(4)
+    kpi_a.metric(
+        label="Margen de Utilidad",
+        value=_margen_txt,
+        help="Utilidad del ejercicio / Ingresos. Muestra N/A mientras no existan ingresos registrados.",
+    )
+    kpi_b.metric(
+        label="Ratio de Solvencia",
+        value=_solvencia_txt,
+        help="Activos / Pasivos. Con pasivos en cero se considera Óptima; sin activos ni pasivos, N/A.",
+    )
+
     st.markdown("---")
-    st.subheader("Saldos Actuales por Cuenta")
 
     if not df_saldos.empty:
-        # Mostramos una tabla estilizada con los datos reales
-        st.dataframe(
-            df_saldos[['codigo', 'descripcion', 'saldo']].style.format({'saldo': 'S/ {:.2f}'}),
-            use_container_width=True,
-            hide_index=True
-        )
+        # Storytelling financiero: dos tarjetas con graficos nativos
+        graf_izq, graf_der = st.columns(2)
+
+        # Tarjeta 1: la ecuacion contable. Antes del cierre, las cuentas de resultados
+        # siguen abiertas, por eso el resultado del ejercicio se apila junto a
+        # pasivo y patrimonio para que ambas barras cuadren.
+        with graf_izq:
+            with st.container(border=True):
+                st.subheader("La Ecuación Contable")
+                st.caption("Activos frente a Pasivo + Patrimonio + Resultado del ejercicio.")
+                df_ecuacion = pd.DataFrame(
+                    {
+                        "Activos": [total_activos, 0.0],
+                        "Pasivos": [0.0, total_pasivos],
+                        "Patrimonio": [0.0, total_patrimonio],
+                        "Resultado del ejercicio": [0.0, utilidad_dashboard],
+                    },
+                    index=["Activos", "Pasivo + Patrimonio"],
+                )
+                st.bar_chart(
+                    df_ecuacion,
+                    color=["#22D3EE", "#F59E0B", "#10B981", "#6366F1"],
+                    height=320,
+                )
+                _dif_cuadre = total_activos - (total_pasivos + total_patrimonio + utilidad_dashboard)
+                if abs(_dif_cuadre) < 0.01:
+                    st.caption("Ecuación balanceada: Activos = Pasivo + Patrimonio + Resultado.")
+                else:
+                    st.caption(f"Diferencia de cuadre detectada: S/ {_dif_cuadre:,.2f}")
+
+        # Tarjeta 2: rendimiento del ejercicio
+        with graf_der:
+            with st.container(border=True):
+                st.subheader("Rendimiento del Ejercicio")
+                st.caption("Ingresos frente a gastos y la utilidad resultante.")
+                if ingresos == 0 and gastos == 0:
+                    st.info("Aún no hay ingresos ni gastos registrados en el periodo.")
+                else:
+                    df_rendimiento = pd.DataFrame(
+                        {
+                            "Ingresos": [ingresos, 0.0, 0.0],
+                            "Gastos": [0.0, gastos, 0.0],
+                            "Utilidad": [0.0, 0.0, utilidad_dashboard],
+                        },
+                        index=["Ingresos", "Gastos", "Utilidad"],
+                    )
+                    st.bar_chart(
+                        df_rendimiento,
+                        color=["#10B981", "#F87171", "#22D3EE"],
+                        height=320,
+                    )
+
+        # El detalle analitico queda disponible, pero fuera del flujo principal
+        with st.expander("Ver detalle analítico por cuenta"):
+            st.dataframe(
+                df_saldos[['codigo', 'descripcion', 'saldo']].style.format({'saldo': 'S/ {:.2f}'}),
+                use_container_width=True,
+                hide_index=True
+            )
     else:
         st.info("No hay transacciones registradas todavía.")
