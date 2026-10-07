@@ -69,36 +69,121 @@ def registrar_asiento_completo(fecha, glosa, detalles_asiento):
     finally:
         conn.close()
 
-def obtener_saldos_cuentas():
+# ============================================================================
+# CLASIFICACION DE CUENTAS: POSICION vs RESULTADO
+# ============================================================================
+# El Balance y el Estado de Resultados no son el mismo tipo de documento, y por
+# eso no pueden recibir el mismo filtro de periodo. Es la unica razon por la que
+# un "parametro mas" no habria bastado: con un unico filtro, el Balance pierde
+# los saldos anteriores al periodo y la ecuacion Activo = Pasivo + Patrimonio
+# se rompe; sin filtro, el Estado de Resultados muestra el resultado acumulado
+# de toda la contabilidad como si fuera el del ejercicio.
+#
+# La division sale del PCGE y la usan los dos estados:
+#   1, 2, 3 Activo          -> POSICION
+#   4     Pasivo            -> POSICION
+#   5     Patrimonio Neto   -> POSICION
+#   6, 9  Costos y gastos   -> RESULTADO
+#   7     Ingresos          -> RESULTADO
+#   8     Resultado del ejercicio (impuesto a la renta, determinacion del
+#         resultado) -> RESULTADO. Es un elemento acreedor por la regla comun
+#         `naturaleza_de_elemento`, pero contablemente es flujo, no posicion.
+#
+# Los elementos que la aplicacion no muestra en ningun estado (ninguno hoy)
+# caen en RESULTADO, que es lo que obliga la ecuacion del balance: una cuenta
+# de resultado que se acumule en el patrimonio sin cerrar deja el estado descuadrado.
+ELEMENTOS_POSICION = (1, 2, 3, 4, 5)
+ELEMENTOS_RESULTADO = (6, 7, 8, 9)
+
+# Subtitulo de cada elemento de activo del PCGE. Vive aqui, y no en la interfaz
+# ni en el modulo de PDF, porque es knowledge contable del catalogo: si cada uno
+# de los dos lo definiera por su cuenta, el estado y su PDF acabarian usando
+# nombres distintos para el mismo bloque.
+ETIQUETAS_ACTIVO = {
+    1: "Activo Disponible y Exigible",
+    2: "Activo Realizable",
+    3: "Activo Inmovilizado",
+}
+
+
+def obtener_saldos_cuentas(fecha_desde=None, fecha_hasta=None):
     """
     Calcula los saldos reales de todas las cuentas con movimientos,
     respetando la naturaleza contable según el elemento del PCGE.
-    """
-    conn = obtener_conexion()
-    
-    # Esta consulta suma los débitos y créditos por cada cuenta
-    query = """
-    SELECT 
-        c.codigo, 
-        c.descripcion, 
-        c.elemento,
-        SUM(d.debe) as total_debe,
-        SUM(d.haber) as total_haber
-    FROM 
-        Cuentas c
-    JOIN 
-        Detalles d ON c.codigo = d.cuenta_codigo
-    GROUP BY 
-        c.codigo, c.descripcion, c.elemento
-    """
-    
-    # Usamos pandas para procesar los datos más fácilmente
-    df = pd.read_sql_query(query, conn)
-    conn.close()
 
-    # Si no hay movimientos, devolvemos un DataFrame vacío
+    PERIODO: es opcional y, si se da, no se aplica igual a todas las cuentas,
+    porque una cuenta de POSICION y una de RESULTADO no responden al mismo
+    periodo (ver `ELEMENTOS_POSICION` y `ELEMENTOS_RESULTADO`):
+
+        posicion  -> ACUMULADO hasta `fecha_hasta`. Un activo comprado en enero
+                     sigue en el balance el 30 de junio. Ignora `fecha_desde`.
+        resultado -> SOLO lo acaecido dentro de [fecha_desde, fecha_hasta].
+
+    Sin periodo, o con los dos extremos en None, el resultado es exactamente el
+    de siempre: todo el historico. El Dashboard Gerencial y las pruebas existentes
+    llaman asi y no deben ver un solo centimo distinto.
+
+    La naturaleza y el signo siguen viniendo de la regla unica
+    `naturaleza_de_elemento`, la misma que consume el Libro Mayor.
+    """
+    condiciones, parametros = [], []
+
+    if fecha_hasta is not None:
+        if fecha_desde is not None:
+            # Periodo completo: cada grupo con su propia ventana.
+            condiciones.append(
+                "(c.elemento IN (1, 2, 3, 4, 5) AND date(a.fecha) <= ?) "
+                "OR (c.elemento IN (6, 7, 8, 9) "
+                "AND date(a.fecha) >= ? AND date(a.fecha) <= ?)"
+            )
+            parametros.append(_texto_fecha(fecha_hasta))
+            parametros.append(_texto_fecha(fecha_desde))
+            parametros.append(_texto_fecha(fecha_hasta))
+        else:
+            # Solo fecha de corte: es un balance a esa fecha. Sin resultado
+            # acumulado que repartir, las cuentas de resultado tambien se
+            # acumulan; dejarlas en cero haria cuadrar el balance por la razon
+            # equivocada.
+            condiciones.append("date(a.fecha) <= ?")
+            parametros.append(_texto_fecha(fecha_hasta))
+
+    # Sin condiciones, el WHERE se omite: es el historico completo, tal como
+    # estaba antes de que existiera el periodo.
+    donde = f"WHERE {' OR '.join(condiciones)}" if condiciones else ""
+
+    conn = obtener_conexion()
+    try:
+        # Esta consulta suma los débitos y créditos por cada cuenta
+        query = f"""
+        SELECT
+            c.codigo,
+            c.descripcion,
+            c.elemento,
+            SUM(d.debe) as total_debe,
+            SUM(d.haber) as total_haber
+        FROM
+            Cuentas c
+        JOIN
+            Detalles d ON c.codigo = d.cuenta_codigo
+        JOIN
+            Asientos a ON a.id = d.asiento_id
+        {donde}
+        GROUP BY
+            c.codigo, c.descripcion, c.elemento
+        """
+        # Usamos pandas para procesar los datos más fácilmente
+        df = pd.read_sql_query(query, conn, params=parametros)
+    finally:
+        conn.close()
+
+    # Si no hay movimientos, devolvemos un DataFrame vacío PERO CON SU ESQUEMA.
+    # Sin la columna `saldo` incluida, el llamador que hace `df['saldo'].sum()`
+    # recibe un KeyError en vez de un cero: el rango sin datos revienta en lugar
+    # de mostrar un estado en cero, que es lo que corresponde.
     if df.empty:
-        return df
+        columnas = ["codigo", "descripcion", "elemento",
+                    "total_debe", "total_haber", "saldo"]
+        return pd.DataFrame(columns=columnas)
 
     # 3. EL CALCULADOR DE SALDOS
     # Aquí aplicamos la lógica matemática del PCGE usando el 'elemento'

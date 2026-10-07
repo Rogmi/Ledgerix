@@ -1,5 +1,5 @@
 """
-FASE 1 — CONGELAMIENTO DEL PROMPT (blindaje antes de tocar nada).
+FASE 2 — EL BLOQUE DE EXCEL YA EXISTE (el prompt base sigue congelado).
 
 Este archivo NO modifica el comportamiento productivo: solo observa. Su unico
 efecto es fallar el dia que alguien altere, sin querer, el prompt que consume
@@ -9,18 +9,22 @@ Que protege
 -----------
 1. Las 4 constantes congeladas por longitud Y por sha256 (un cambio de un solo
    caracter las delata, aunque la longitud no se mueva).
-2. Que el prompt base NO contenga todavia el bloque de derivacion de Excel.
+2. Que el prompt base NO contenga el bloque de derivacion de Excel: el bloque
+   vive aparte y solo se concatena para una hoja de calculo.
 3. Que el PDF reciba el prompt base byte a byte, capturado del request real.
-4. Que la ruta de Excel reciba HOY tambien el prompt base byte a byte.
+4. Que la ruta de Excel reciba el prompt base y, anadido al final, SOLO el
+   bloque de Excel.
 5. Que la ruta de escaner visual (tercer consumidor del mismo prompt) quede
    libre del bloque de Excel.
+6. Que un origen ausente o desconocido reciba el prompt base: ante la duda no se
+   anade ningun bloque.
 
-Interruptores de FASE 2
-----------------------
-- `test_excel_por_ahora_recibe_el_prompt_base` falla a proposito en cuanto exista
-  `BLOQUE_EXCEL_DERIVACION`: obliga a actualizar la expectativa de Excel.
-- `test_contrato_seleccion_de_prompt` se activa solo cuando exista
-  `ia._prompt_para_origen` y exige el contrato completo.
+Interruptores ya activados
+--------------------------
+- `test_existe_bloque_excel_derivacion` exige el bloque (FASE 1 exigia que no
+  existiera).
+- `test_contrato_seleccion_de_prompt` ya no hace `skip`: exige el contrato de
+  seleccion completo.
 """
 
 import hashlib
@@ -45,11 +49,24 @@ import ia_engine as ia  # noqa: E402
 # --------------------------------------------------------------------------- #
 # 1. Constantes congeladas: longitud y contenido
 # --------------------------------------------------------------------------- #
+# Re-congeladas el 2026-10-05, al corregir la regresion de la depreciacion (cuenta
+# 39 al DEBE). Los valores anteriores congelaban la seccion E de CRITERIO_DEBE_HABER,
+# que prohibia leer la COLUMNA del importe y por eso obligaba a deducir el lado solo
+# del signo; junto con `app._serializar_tabla`, que borraba las celdas vacias, el
+# documento se quedaba sin ninguna evidencia del lado y la 39 caia al DEBE.
+# Re-congeladas de nuevo al afinar esa seccion: la pagina 2 del libro no rotula sus
+# columnas (los rotulos IZQUIERDO/DERECHO, CARGO/ABONO y DEBE/HABER estan en la
+# pagina 1), asi que la regla tiene que permitir calibrar las columnas con las filas de
+# notacion inequivoca de la propia pagina. El tripwire sigue cumpliendo su funcion:
+# vuelve a delatar cualquier cambio posterior.
+#
+# La FASE 2 no las toco: `BLOQUE_EXCEL_DERIVACION` se concatena en
+# `_prompt_para_origen`, nunca dentro de estas cadenas.
 CONGELADAS = {
-    "CRITERIO_DEBE_HABER": (6495, "d5b3a1883ddb1f99573d722a95da21678d7cd8b52bb59b32d78690e94576ee99"),
-    "instrucciones_contador": (7735, "af36bd25a2fd4e14710e758b65086bafabad9e78fc909e103f2b0b334decbb20"),
+    "CRITERIO_DEBE_HABER": (8052, "dc214a8ea8fb23386da8f60b1a9d00398d587366573d130afcd3c32a650ff7fe"),
+    "instrucciones_contador": (9292, "f759fb661c7876516d9270c841ccdd47695b74cef19c42016fe4647d94135902"),
     "CONTRATO_MULTI_PARTIDA": (2028, "bc4f6129455e33c566cd02984b8b70ca20151e6724356c6e4b146413d190934d"),
-    "instrucciones_agente_excel": (9362, "c61e342480d55461e498ae71f87bc1d3328a61566835cd1fee15924c98eb057e"),
+    "instrucciones_agente_excel": (10919, "457f820d68368a1768b523d31934fab9ff1545b3b5efa81dad32192bca083548"),
 }
 
 
@@ -75,14 +92,12 @@ def test_constante_congelada_no_cambio_de_contenido(nombre):
 
 
 # --------------------------------------------------------------------------- #
-# 2. El prompt base no debe contener todavia el bloque de Excel
+# 2. El bloque de Excel existe, pero NO esta en el prompt base
 # --------------------------------------------------------------------------- #
 MARCAS_DEL_BLOQUE_EXCEL = [
     "EXCEPCION UNICA A LA REGLA 7",
-    "COSTO DE VENTAS = mercaderia comprada",
-    "asiento DERIVADO del saldo final de inventario",
-    "es CONTEXTO del caso (un saldo final",
-    "cuenta 69 al DEBE y cuenta 20 al HABER",
+    "UN SALDO QUE SE OBSERVA NO ES UNA OPERACION",
+    "EL SISTEMA DERIVA LO QUE FALTA, NO TU",
 ]
 
 
@@ -94,27 +109,26 @@ def test_prompt_base_no_tiene_el_bloque_excel(marca):
     )
 
 
-def test_no_existe_bloque_excel_derivacion_en_fase_1():
-    assert not hasattr(ia, "BLOQUE_EXCEL_DERIVACION"), (
-        "BLOQUE_EXCEL_DERIVACION ya existe: la FASE 2 fue implementada. "
-        "Actualiza las expectativas de Excel de este archivo."
+def test_existe_bloque_excel_derivacion():
+    """FASE 2: el bloque existe. Lo que se protege ahora es que no se filtre al base."""
+    assert ia.BLOQUE_EXCEL_DERIVACION, "el bloque de Excel no puede estar vacio"
+    assert ia.BLOQUE_EXCEL_DERIVACION not in ia.instrucciones_agente_excel, (
+        "el bloque tiene que ser una cadena aparte: concatenado dentro del prompt base "
+        "cambiaria su sha256 congelado y llegaria al PDF"
     )
 
 
 # --------------------------------------------------------------------------- #
-# 3. Contrato de seleccion de prompt (armado para FASE 2)
+# 3. Contrato de seleccion de prompt
 # --------------------------------------------------------------------------- #
 ORIGENES_SIN_BLOQUE = ["", "pdf", "docx", "PDF", "DOCX", "desconocido", None]
 ORIGENES_CON_BLOQUE = ["xlsx", "xls", "XLSX", "XLS"]
 
 
 def test_contrato_seleccion_de_prompt():
-    selector = getattr(ia, "_prompt_para_origen", None)
-    if selector is None:
-        pytest.skip("FASE 2 pendiente: ia._prompt_para_origen aun no existe")
-
+    selector = ia._prompt_para_origen
     base = ia.instrucciones_agente_excel
-    bloque = getattr(ia, "BLOQUE_EXCEL_DERIVACION", "")
+    bloque = ia.BLOQUE_EXCEL_DERIVACION
 
     for origen in ORIGENES_SIN_BLOQUE:
         assert selector(origen) == base, f"el origen {origen!r} recibio un prompt distinto del base"
@@ -191,12 +205,12 @@ TEXTO_EXCEL = """Fecha,Glosa,Cuenta,Debe,Haber
 """
 
 
-def _capturar_prompt(monkeypatch, texto):
+def _capturar_prompt(monkeypatch, texto, origen=None):
     """Corre el flujo real de punta a punta y devuelve el system prompt enviado."""
     cliente = _ClienteFalso(LOTE_QUE_SI_FUNCIONA)
     monkeypatch.setattr(ia, "cliente", cliente)
 
-    exito, resultado = ia.analizar_excel_completo(texto)
+    exito, resultado = ia.analizar_excel_completo(texto, origen=origen)
     assert exito, f"el flujo real fallo con un doble valido: {resultado}"
     assert len(cliente.llamadas) == 1, f"se esperaba 1 llamada y hubo {len(cliente.llamadas)}"
 
@@ -206,7 +220,7 @@ def _capturar_prompt(monkeypatch, texto):
 
 
 def test_pdf_envia_el_prompt_base_byte_a_byte(monkeypatch):
-    capturado = _capturar_prompt(monkeypatch, TEXTO_PDF)
+    capturado = _capturar_prompt(monkeypatch, TEXTO_PDF, origen="pdf")
     assert capturado == ia.instrucciones_agente_excel, (
         "la ruta PDF dejo de enviar el prompt base byte a byte"
     )
@@ -215,16 +229,24 @@ def test_pdf_envia_el_prompt_base_byte_a_byte(monkeypatch):
     )
 
 
-def test_excel_por_ahora_recibe_el_prompt_base(monkeypatch):
+def test_excel_recibe_el_prompt_base_mas_el_bloque(monkeypatch):
     """
-    FASE 1: sin BLOQUE_EXCEL_DERIVACION, la ruta de Excel recibe el prompt base
-    exacto. En FASE 2 este test debe cambiar a exigir base + bloque.
+    FASE 2: la ruta de Excel recibe el prompt base intacto y, anadido al final, solo el
+    bloque de Excel. El bloque va DESPUES porque define una excepcion a las reglas del
+    base: si fuera delante, el prompt base lo contradiría al final.
     """
-    capturado = _capturar_prompt(monkeypatch, TEXTO_EXCEL)
-    assert capturado == ia.instrucciones_agente_excel, (
-        "la ruta Excel recibio algo distinto del prompt base en FASE 1"
+    capturado = _capturar_prompt(monkeypatch, TEXTO_EXCEL, origen="xlsx")
+    assert capturado == ia.instrucciones_agente_excel + ia.BLOQUE_EXCEL_DERIVACION
+    assert capturado.startswith(ia.instrucciones_agente_excel), (
+        "el prompt base debe quedar entero al principio del prompt de Excel"
     )
-    assert hashlib.sha256(capturado.encode("utf-8")).hexdigest() == CONGELADAS["instrucciones_agente_excel"][1]
+    assert hashlib.sha256(ia.instrucciones_agente_excel.encode("utf-8")).hexdigest() == CONGELADAS["instrucciones_agente_excel"][1]
+
+
+def test_sin_origen_recibe_el_prompt_base(monkeypatch):
+    """Sin origen no se anade nada: ante la duda, el prompt congelado y nada mas."""
+    capturado = _capturar_prompt(monkeypatch, TEXTO_EXCEL)
+    assert capturado == ia.instrucciones_agente_excel
 
 
 def test_ruta_escaneo_visual_no_recibe_el_bloque_excel():
@@ -238,6 +260,10 @@ def test_ruta_escaneo_visual_no_recibe_el_bloque_excel():
     completo = ia.PREFIJO_PROMPT_VISUAL + ia.instrucciones_agente_excel
     assert ia.instrucciones_agente_excel in completo, (
         "el escaner visual debe seguir embebiendo el prompt base completo"
+    )
+    assert ia.BLOQUE_EXCEL_DERIVACION not in completo, (
+        "el escaner visual recibio el bloque de Excel: el contexto de inventario "
+        "solo le sirve a una hoja de calculo"
     )
     for marca in MARCAS_DEL_BLOQUE_EXCEL:
         assert marca not in completo, f"el escaner visual recibio la marca de Excel {marca!r}"

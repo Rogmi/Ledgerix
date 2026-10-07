@@ -1,10 +1,15 @@
+import hashlib
+import json
 import re
 import time
 import unicodedata
+from pathlib import Path
 
 import streamlit as st
 import pandas as pd
 import logica as lg # Conectamos nuestro motor financiero
+import database as bd # Esquema, catalogo PCGE e inicializacion de la base de datos
+import reportes_pdf # Maquetacion de los PDF formales (Libro Diario, Libro Mayor, Estados)
 import datetime
 import ia_engine as ia
 import transcripcion as voz
@@ -113,6 +118,47 @@ def fecha_ia_a_objeto(fecha_ia):
 
 
 # ============================================================================
+# PERIODO: UN SOLO MECANISMO PARA LIBROS Y ESTADOS FINANCIEROS
+# ============================================================================
+# Vive aqui, a nivel de modulo, y no dentro de la seccion de Libros Contables
+# porque lo usan tres paginas distintas. Duplicarlo seria la forma mas rapida de
+# que el Libro Diario y el Balance dejaran de aceptar el mismo rango un dia de
+# estos, sin que ninguna prueba se-enterara.
+
+def _periodo(rango):
+    """
+    Normaliza la salida de `st.date_input` a `(desde, hasta)`.
+
+    Devuelve `(None, None)` mientras el usuario aun no ha elegido la fecha final:
+    `date_input` entrega una tupla de un solo elemento en ese instante. Es el
+    mismo contrato que usan los Libros Contables.
+    """
+    if isinstance(rango, (tuple, list)) and len(rango) == 2:
+        return rango[0], rango[1]
+    return None, None
+
+
+def _sufijo_periodo(desde, hasta):
+    """
+    Sufijo de archivo con el periodo, para que dos descargas no se confundan.
+
+    Sin periodo informado devuelve 'completo': el nombre del archivo debe decir
+    que se exporto todo, nunca insinuar un corte que no se aplico.
+    """
+    def _iso(valor):
+        return valor.isoformat() if hasattr(valor, "isoformat") else ""
+
+    inicio, fin = _iso(desde), _iso(hasta)
+    if inicio and fin:
+        return f"{inicio}_{fin}"
+    if fin:
+        return f"hasta_{fin}"
+    if inicio:
+        return f"desde_{inicio}"
+    return "completo"
+
+
+# ============================================================================
 # HUMAN-IN-THE-LOOP: un único mecanismo de borrador para todo el sistema
 # ============================================================================
 # Todo lo que produzca la IA (documento o enunciado) y todo lo que.capture el
@@ -127,6 +173,50 @@ def fecha_ia_a_objeto(fecha_ia):
 # doble y exige la aprobacion humana antes de tocar la base de datos.
 
 TOLERANCIA_CENTIMOS_HIL = 0.01
+
+
+# --------------------------------------------------------------------------- #
+# IDENTIDAD DEL DOCUMENTO EXCEL: SOLO PARA NO DUPLICAR EN SILENCIO
+# --------------------------------------------------------------------------- #
+# La huella es el sha256 del TEXTO YA SANEADO del Excel, no de sus asientos: es la
+# identidad exacta del documento procesado, no una heuristica por fecha, glosa,
+# importe ni cuenta (que dos asientos coincidan en esos campos NO prueba que sean el
+# mismo documento). Cuando la misma hoja vuelve al borrador despues de haber sido
+# registrada, se avisa y se exige una confirmacion explicita antes de volver a
+# guardarla. Sin huella (dictado, PDF, escaner o captura manual) no hay ninguna
+# comprobacion: esos flujos no cambian.
+def _ruta_documentos_registrados():
+    return Path(lg.DB_PATH).with_name("documentos_registrados.json")
+
+
+def _leer_documentos_registrados():
+    ruta = _ruta_documentos_registrados()
+    try:
+        with open(ruta, "r", encoding="utf-8") as archivo:
+            datos = json.load(archivo)
+    except (OSError, ValueError):
+        return set()
+    return set(datos) if isinstance(datos, list) else set()
+
+
+def _marcar_documento_registrado(huella):
+    if not huella:
+        return
+    huellas = _leer_documentos_registrados()
+    if huella in huellas:
+        return
+    huellas.add(huella)
+    try:
+        with open(_ruta_documentos_registrados(), "w", encoding="utf-8") as archivo:
+            json.dump(sorted(huellas), archivo, ensure_ascii=False, indent=2)
+    except OSError:
+        # No poder persistir la huella no puede impedir un guardado ya realizado: a lo
+        # sumo se volvera a avisar en la proxima pasada, que es el lado seguro.
+        pass
+
+
+def _huella_de_documento(texto):
+    return hashlib.sha256((texto or "").encode("utf-8")).hexdigest()
 
 
 def obtener_cuentas_pcge():
@@ -181,6 +271,10 @@ def cargar_borrador(asientos, origen):
     st.session_state.origen_borrador = origen
     st.session_state.avisos_borrador = []
     st.session_state.resumen_borrador = ""
+    # La huella solo la vuelve a poner el flujo de Excel, despues de cargar el
+    # borrador. Asi, un dictado, un PDF, un escaner o una captura manual nunca
+    # heredan la identidad de un Excel anterior.
+    st.session_state.pop("huella_documento", None)
 
 
 def render_borrador(origen):
@@ -310,8 +404,24 @@ def render_borrador(origen):
                  + " o desmarca 'Aprobar' para descartarlos.")
     st.caption(f"{len(a_guardar)} asiento(s) aprobados y validados, listos para persistir.")
 
+    # Advertencia de reproceso: si este MISMO Excel ya fue registrado antes, no se
+    # guarda en silencio. Se dice y se exige una confirmacion explicita, distinta de
+    # la aprobacion de cada asiento, que aqui solo autoriza el duplicado.
+    huella_documento = st.session_state.get("huella_documento")
+    documento_ya_registrado = bool(huella_documento) and huella_documento in _leer_documentos_registrados()
+    reproceso_confirmado = True
+    if documento_ya_registrado:
+        st.warning("Este mismo documento Excel ya fue registrado en la Base de Datos. "
+                   "Si guardas otra vez, sus operaciones se registrarán de nuevo como un "
+                   "duplicado. No se guarda nada salvo que lo confirmes.")
+        reproceso_confirmado = st.checkbox(
+            "Confirmo que quiero registrar este mismo documento otra vez",
+            value=False,
+            key=f"confirmar_reproceso_{borrador_id}",
+        )
+
     if st.button("Guardar Asientos Aprobados en BD", type="primary",
-                 disabled=bool(bloqueos) or not a_guardar):
+                 disabled=bool(bloqueos) or not a_guardar or (documento_ya_registrado and not reproceso_confirmado)):
         exitos, errores = 0, []
         for asiento in a_guardar:
             try:
@@ -326,6 +436,8 @@ def render_borrador(origen):
             except Exception as e:
                 errores.append(f"Asiento del {asiento['fecha']}: {e}")
 
+        if exitos:
+            _marcar_documento_registrado(huella_documento)
         st.session_state.borrador_ia = None
         if exitos:
             st.success(f"Se registraron {exitos} asientos contables en la Base de Datos.")
@@ -337,23 +449,56 @@ def render_borrador(origen):
 
 
 def _serializar_tabla(filas):
-    """Convierte una tabla en filas de celdas ya sin celdas vacías."""
+    """
+    Convierte una tabla en filas de celdas, conservando la POSICIÓN de cada celda.
+
+    Las celdas vacías se conservan como cadenas vacías y solo se descarta la fila
+    que está enteramente vacía. Antes se eliminaban las celdas vacías, y eso
+    borraba la información que dice en qué columna estaba escrito cada importe:
+    en el libro contable del taller, la fila `39 Depreciación ACUMULADA -A`
+    tiene su 135 en la columna HABER y la fila `68 Gastos de Depreciación G+`
+    lo tiene en la columna DEBE. Al quitar las vacías, ambas quedaban idénticas
+    (`... | 135`) y el importe perdía su lado, así que la IA ya no podía leer
+    del documento en qué columna estaba y tenía que deducirlo de la notación
+    (`-A`), que es justo lo que producía el 39 en el DEBE.
+
+    La posición es la única fuente que el documento ofrece sobre el lado, y este
+    lector es el único punto donde puede perderse: no se interpreta nada aquí,
+    solo se transcribe la rejilla tal como está.
+
+    Las filas se igualan de ancho con celdas vacías a la derecha porque la rejilla
+    que ve la IA tiene que ser rectangular: si una fila llega con menos celdas que
+    las demás, "el importe que está bajo HABER" no apunta a la misma columna en cada
+    línea, que es exactamente la ambigüedad que hay que eliminar.
+    """
     limpias = []
     for fila in filas:
-        celdas = [str(celda).strip() for celda in fila if celda is not None and str(celda).strip()]
-        if celdas:
+        celdas = [str(celda).strip() if celda is not None else "" for celda in fila]
+        if any(celdas):
             limpias.append(celdas)
-    return limpias
+
+    if not limpias:
+        return limpias
+
+    ancho = max(len(fila) for fila in limpias)
+    return [fila + [""] * (ancho - len(fila)) for fila in limpias]
 
 
 def _tabla_es_fiable(filas, texto_pagina):
     """
-    Descarta las tablas ficticias: exige ≥3 filas, ≥2 columnas y que ninguna ficha
-    de la tabla falte en el texto real de la página (control anti-truncamiento).
+    Descarta las tablas ficticias: exige ≥3 filas, ≥2 columnas con CONTENIDO y que
+    ninguna ficha de la tabla falte en el texto real de la página (control
+    anti-truncamiento).
+
+    Las columnas se cuentan con contenido y no con celdas, porque `_serializar_tabla`
+    ya conserva las celdas vacías para no perder la posición de los importes. Una
+    fila con una sola celda de texto y el resto vacías sigue siendo, para este
+    control, una fila de una columna: contarla como de cuatro cambiaría qué páginas
+    se leen como tabla y cuáles como texto maquetado.
     """
     if len(filas) < 3:
         return False
-    if sum(1 for fila in filas if len(fila) >= 2) < len(filas) * 0.6:
+    if sum(1 for fila in filas if sum(1 for celda in fila if celda) >= 2) < len(filas) * 0.6:
         return False
 
     fichas_pagina = set(_FICHAS.findall((texto_pagina or "").lower()))
@@ -543,6 +688,83 @@ with st.sidebar:
     )
 st.sidebar.markdown("---")
 st.sidebar.caption("Ledgerix SaaS - Versión 1.0")
+
+# ============================================================================
+# 2-bis. ARRANQUE: QUE LA BASE DE DATOS EXISTA Y ESTE LISTA
+# ============================================================================
+# `streamlit run app.py` tiene que funcionar sobre una instalacion limpia, sin que
+# nadie tenga que acordarse de ejecutar `database.py` antes. Este es el UNICO punto
+# del programa que abre la base para escribirla.
+#
+# Que estuviera aqui no es una comodidad: `logica.obtener_conexion()` es una
+# `sqlite3.connect()` y eso, por si solo, CREA el archivo. Sobre una base inexistente
+# la aplicacion se abria sin error y dejaba `datos/contabilidad.db` con 0 bytes, y
+# recien al entrar a "Registro de Transacciones" saltaba `no such table: Cuentas`.
+#
+# La logica NO esta aqui: vive en `database.py`, que es la misma que ejecuta el
+# script manual, para que no haya dos copias que puedan divergir. Esta llamada solo la
+# invoca y avisa de lo que encontro.
+#
+# Va despues de `set_page_config` (que debe ser el primer comando de Streamlit) y
+# antes del enrutamiento, que es donde la base se lee por primera vez.
+
+@st.cache_resource(show_spinner=False)
+def _asegurar_base_de_datos(ruta: str):
+    """
+    Inicializa la base de datos solo si hace falta. Nunca destruye datos.
+
+    Devuelve lo que `database.inicializar_base_de_datos_si_es_necesario()` reporta:
+    que estado encontro (inexistente, vacia, parcial, lista o inconsistente) y que
+    hizo al respecto.
+
+    La ruta llega por parametro y no se lee por dentro, a proposito: `logica.DB_PATH`
+    es un nombre propio de `logica.py` (las pruebas lo sustituyen con `monkeypatch`),
+    y leer una constante de modulo desde aqui escribiria en la base real durante las
+    pruebas. Por la misma razon se le pasa `lg.DB_PATH` y no `bd.DB_PATH`.
+
+    `@st.cache_resource` hace que el cuerpo corra UNA vez por sesion del servidor y
+    que los reruns siguientes devuelvan el resultado cacheado, sin volver a tocar el
+    disco. Si la funcion lanza, la excepcion no se cachea: el siguiente render vuelve
+    a intentarlo.
+    """
+    return bd.inicializar_base_de_datos_si_es_necesario(ruta)
+
+
+try:
+    _resultado_bd = _asegurar_base_de_datos(lg.DB_PATH)
+except Exception as _error_bd:  # noqa: BLE001 - la app no debe morir por un problema de arranque
+    _resultado_bd = {
+        "estado": bd.ERROR_ACCESO,
+        "accion": bd.SIN_CAMBIOS,
+        "ruta": lg.DB_PATH,
+        "detalle": f"No se pudo preparar la base de datos: {_error_bd}",
+        "tablas_creadas": [],
+        "cuentas_insertadas": 0,
+        "cuentas": 0,
+        "asientos": 0,
+        "detalles": 0,
+    }
+
+# Avisos de arranque. Solo se muestran los dos estados que son un problema real de la
+# base (inaccesible, o con movimientos sin catalogo). Una base recien inicializada con
+# el PCGE cargado y cero asientos es el estado normal de una instalacion limpia: se
+# inicializa igual, pero en silencio, para que la portada no arranque con un aviso
+# tecnico antes de que exista un solo dato.
+if _resultado_bd["estado"] == bd.ERROR_ACCESO:
+    # Sin acceso a la base ninguna pagina funciona: se dice claro y se detiene el
+    # render en vez de dejar que cada consulta reviente con su propio traceback.
+    st.error(f"Ledgerix no puede trabajar con la base de datos.\n\n{_resultado_bd['detalle']}")
+    st.code(_resultado_bd["ruta"], language=None)
+    st.stop()
+elif _resultado_bd["estado"] == bd.INCONSISTENTE:
+    # Movimientos sin catalogo. No se repara solo porque no hay forma de saber que
+    # cuentas son las correctas; las demas paginas siguen Podiendo leerse.
+    st.warning(
+        "La base de datos esta incompleta y **no se ha modificado**.\n\n"
+        f"{_resultado_bd['detalle']}\n\n"
+        "Mientras tanto puedes consultar los libros y los estados financieros, pero no "
+        "se pueden registrar asientos nuevos hasta que el catalogo de cuentas se complete."
+    )
 
 # Si la navegación fue programática (botón CTA), esa orden manda en este primer render;
 # el componente alcanza el mismo estado en el rerun siguiente.
@@ -1008,13 +1230,21 @@ elif menu == "Registro de Transacciones":
                     # 3. BOTÓN DE IA (el texto que se previsualiza es el que se envía)
                 if st.button("Generar Borrador con IA", type="primary", use_container_width=True):
                     with st.spinner("Extrayendo filas del documento y armando la partida doble..."):
-                        # Mandamos EXACTAMENTE el texto ya saneado y previsualizado
-                        exito_ia, lote_operaciones = ia.analizar_excel_completo(texto_para_ia)
+                        # Mandamos EXACTAMENTE el texto ya saneado y previsualizado.
+                        # La extensión decide el prompt: solo una hoja de cálculo recibe
+                        # el bloque que separa el CONTEXTO de las operaciones.
+                        exito_ia, lote_operaciones = ia.analizar_excel_completo(
+                            texto_para_ia, origen=extension)
 
                         if exito_ia:
                             # El lote crudo va al borrador comun: cada elemento es un
                             # asiento y sus partidas se conservan tal cual llegaron.
                             cargar_borrador(lote_operaciones, "documento cargado")
+                            # La identidad exacta del Excel queda en la sesion para que
+                            # el borrador pueda advertir si ese mismo documento ya fue
+                            # registrado. Solo la hoja de calculo la recibe.
+                            if extension in ("xlsx", "xls"):
+                                st.session_state["huella_documento"] = _huella_de_documento(texto_para_ia)
                             filas = sum(len(op["asiento"]) for op in lote_operaciones)
                             st.session_state.avisos_borrador = getattr(lote_operaciones, "avisos", [])
                             st.session_state.resumen_borrador = (
@@ -1027,11 +1257,7 @@ elif menu == "Registro de Transacciones":
         elif ia_metodo == "Dictado por Voz":
             st.markdown("**Reconocimiento de Voz a Texto (Groq Whisper)**")
             st.info("Graba tu dictado con el micrófono. El audio se transcribirá usando Groq y el texto resultante podrá revisarse antes de generar el asiento.")
-            audio_grabado=None
-            try:
-                audio_grabado=st.audio_input("Grabar audio", type="wav")
-            except Exception:
-                st.error("No se pudo acceder al micrófono. Verifica permisos del navegador/sistema.")
+            audio_grabado = st.audio_input("Grabar audio")
             if audio_grabado is not None:
                 st.audio(audio_grabado, format="audio/wav")
                 if st.button("Transcribir audio con Groq", type="secondary", use_container_width=True):
@@ -1172,14 +1398,15 @@ elif menu == "Libros Contables":
         df["Fecha"] = pd.to_datetime(df["Fecha"]).dt.date
         return df[[c for c in columnas if c in df.columns]]
 
-    def _periodo(rango):
-        # date_input devuelve una tupla de 1 elemento mientras el usuario elige la fecha final.
-        if isinstance(rango, (tuple, list)) and len(rango) == 2:
-            return rango[0], rango[1]
-        return None, None
-
     def _soles(valor):
         return f"S/ {valor:,.2f}"
+
+    def _fecha_texto(valor):
+        """Fecha en dd/mm/aaaa para los encabezados de cada grupo."""
+        try:
+            return valor.strftime("%d/%m/%Y")
+        except AttributeError:
+            return str(valor)
 
     cfg_fecha = st.column_config.DateColumn("Fecha", format="DD/MM/YYYY", width="small")
     cfg_asiento = st.column_config.TextColumn("N° Asiento", width="small")
@@ -1228,6 +1455,12 @@ elif menu == "Libros Contables":
                 _COLS_DIARIO,
             )
         else:
+            # Sin asientos no hay periodo ni filtros que propagar al PDF: se
+            # dejan en None para que el contexto del documento diga 'historico'
+            # en vez de inventar un rango. None tambien significa 'sin filtro',
+            # que es lo que espera el generador: por eso el contexto se arma con
+            # `(x or "")`, y no con `.strip()` sobre un valor que puede ser None.
+            desde_d = hasta_d = cuenta_d = glosa_d = None
             df_diario = pd.DataFrame(columns=_COLS_DIARIO)
             st.info("Todavía no hay asientos registrados. El Libro Diario se alimenta de los asientos "
                     "aprobados desde 'Registro de Transacciones'.")
@@ -1245,26 +1478,64 @@ elif menu == "Libros Contables":
             m4.metric("Diferencia (Debe - Haber)", _soles(diferencia_d),
                       delta="Partida doble cuadrada" if diferencia_d == 0 else "Revisar el conjunto filtrado",
                       delta_color="off" if diferencia_d == 0 else "inverse",
-                      help="Control de cuadre del conjunto filtrado: al ser cero, el Debe y el Haber "
-                           "de lo seleccionado están equilibrados.")
+help="Control de cuadre del conjunto filtrado: al ser cero, el Debe y el Haber "
+                            "de lo seleccionado están equilibrados.")
 
-        with st.container(border=True):
-            st.dataframe(
-                df_diario,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Fecha": cfg_fecha,
-                    "N° Asiento": cfg_asiento,
-                    "Glosa": cfg_glosa,
-                    "Cuenta PCGE": cfg_cuenta,
-                    "Denominación": cfg_denom,
-                    "Debe": cfg_debe,
-                    "Haber": cfg_haber,
-                },
-            )
-            if df_diario.empty:
+        # --- EXPORTACION A PDF ---
+        # El PDF se arma con `df_diario`, el MISMO DataFrame que se acaba de pintar
+        # arriba: no se vuelve a consultar la base de datos, de modo que el
+        # documento y la pantalla no pueden discrepar. El generador no decide
+        # cuales son los asientos ni los importes, solo los maqueta.
+        _pdf_diario = reportes_pdf.generar_pdf_libro_diario(
+            df_diario,
+            {
+                "periodo": (desde_d, hasta_d),
+                "cuenta": (cuenta_d or "").strip() or None,
+                "glosa": (glosa_d or "").strip() or None,
+                "total_asientos": int(df_diario["N° Asiento"].nunique()),
+                "total_partidas": int(len(df_diario)),
+            },
+        )
+        st.download_button(
+            "Exportar PDF",
+            data=_pdf_diario,
+            file_name=f"libro_diario_{_sufijo_periodo(desde_d, hasta_d)}.pdf",
+            mime="application/pdf",
+            disabled=df_diario.empty,
+            help=("Genera el Libro Diario en PDF con el periodo y los filtros que estas viendo. "
+                  "Se deshabilita cuando el filtro no devuelve ningun asiento."),
+        )
+
+        # El Diario se lee asiento por asiento. La fecha y la glosa viven en la tabla
+        # Asientos, o sea que son UNA por asiento y se repiten en cada una de sus
+        # partidas: se muestran una sola vez en el encabezado y la tabla interna deja
+        # de repetirlas, dejando solo el detalle contable del asiento.
+        if df_diario.empty:
+            with st.container(border=True):
                 st.caption("No se encontraron registros con los filtros aplicados.")
+        else:
+            _COLS_DETALLE_D = ["Cuenta PCGE", "Denominación", "Debe", "Haber"]
+            # Orden explicito para no depender del ORDER BY de SQLite al agrupar.
+            _diario_ordenado = df_diario.sort_values(["Fecha", "N° Asiento"], kind="stable")
+            for _numero_asiento, _partidas in _diario_ordenado.groupby("N° Asiento", sort=True):
+                _cabecera = _partidas.iloc[0]
+                with st.container(border=True):
+                    st.markdown(
+                        f"**Asiento #{_numero_asiento}** "
+                        f"| {_fecha_texto(_cabecera['Fecha'])} "
+                        f"| {_cabecera['Glosa']}"
+                    )
+                    st.dataframe(
+                        _partidas[_COLS_DETALLE_D],
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Cuenta PCGE": cfg_cuenta,
+                            "Denominación": cfg_denom,
+                            "Debe": cfg_debe,
+                            "Haber": cfg_haber,
+                        },
+                    )
 
     # ============================= LIBRO MAYOR ============================
     with tab_mayor:
@@ -1306,6 +1577,7 @@ elif menu == "Libros Contables":
                     _naturaleza_m = _ficha["naturaleza"].iloc[0]
         else:
             cuenta_m, codigo_m = "Todas las cuentas", None
+            desde_m = hasta_m = _naturaleza_m = None
             df_mayor = pd.DataFrame(columns=_COLS_MAYOR)
             st.info("Todavía no hay asientos registrados, así que el Libro Mayor no tiene movimientos "
                     "que consolidar.")
@@ -1327,25 +1599,64 @@ elif menu == "Libros Contables":
                            "No se muestra un saldo único para 'Todas las cuentas': cada cuenta tiene "
                            "naturaleza propia y mezclarlas no produce un saldo contable.")
 
-        with st.container(border=True):
-            st.dataframe(
-                df_mayor,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Fecha": cfg_fecha,
-                    "N° Asiento": cfg_asiento,
-                    "Cuenta PCGE": cfg_cuenta,
-                    "Denominación": cfg_denom,
-                    "Glosa": cfg_glosa,
-                    "Debe": cfg_debe,
-                    "Haber": cfg_haber,
-                    "Saldo": cfg_saldo,
-                },
-            )
-            if df_mayor.empty:
+        # --- EXPORTACION A PDF ---
+        # Mismo criterio que en el Diario: se exporta `df_mayor` tal cual se
+        # muestra. El nombre de archivo incluye el periodo y el codigo de cuenta
+        # cuando hay uno, para no sobrescribir la exportacion de otra cuenta.
+        _pdf_mayor = reportes_pdf.generar_pdf_libro_mayor(
+            df_mayor,
+            {
+                "periodo": (desde_m, hasta_m),
+                "cuenta_texto": cuenta_m if codigo_m is not None else None,
+                "naturaleza": _naturaleza_m if codigo_m is not None else None,
+            },
+        )
+        _nombre_mayor = f"libro_mayor_{_sufijo_periodo(desde_m, hasta_m)}"
+        if codigo_m is not None:
+            _nombre_mayor += f"_cuenta_{codigo_m}"
+        st.download_button(
+            "Exportar PDF",
+            data=_pdf_mayor,
+            file_name=f"{_nombre_mayor}.pdf",
+            mime="application/pdf",
+            disabled=df_mayor.empty,
+            help=("Genera el Libro Mayor en PDF con el periodo y la cuenta que estas viendo. "
+                  "Se deshabilita cuando el filtro no devuelve ningun movimiento."),
+        )
+
+        # El Mayor se lee cuenta por cuenta. El codigo y la denominacion identifican la
+        # cuenta, asi que van en el encabezado. En cambio la fecha, el numero de asiento
+        # y la glosa SI se conservan en la tabla: son el detalle del movimiento, y el
+        # saldo acumulado solo tiene sentido avanzando dentro de una misma cuenta.
+        if df_mayor.empty:
+            with st.container(border=True):
                 st.caption("No se encontraron registros con los filtros aplicados.")
-            elif codigo_m is None:
+        else:
+            _COLS_DETALLE_M = ["Fecha", "N° Asiento", "Glosa", "Debe", "Haber", "Saldo"]
+            # Orden explicito por cuenta y, dentro de ella, cronologico: es el mismo
+            # orden que ya aplica la consulta. Asi los grupos quedan contiguos y el
+            # Saldo sigue siendo el acumulado de ESA cuenta.
+            _mayor_ordenado = df_mayor.sort_values(
+                ["Cuenta PCGE", "Fecha", "N° Asiento"], kind="stable"
+            )
+            for _codigo_cuenta, _movimientos in _mayor_ordenado.groupby("Cuenta PCGE", sort=True):
+                _denominacion_cuenta = _movimientos["Denominación"].iloc[0]
+                with st.container(border=True):
+                    st.markdown(f"**Cuenta PCGE: {_codigo_cuenta} — {_denominacion_cuenta}**")
+                    st.dataframe(
+                        _movimientos[_COLS_DETALLE_M],
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Fecha": cfg_fecha,
+                            "N° Asiento": cfg_asiento,
+                            "Glosa": cfg_glosa,
+                            "Debe": cfg_debe,
+                            "Haber": cfg_haber,
+                            "Saldo": cfg_saldo,
+                        },
+                    )
+            if codigo_m is None:
                 st.caption("La columna Saldo es el acumulado propio de cada cuenta. "
                            "Selecciona una cuenta para ver su saldo final como indicador.")
 
@@ -1353,7 +1664,43 @@ elif menu == "Estados Financieros":
     st.title("Estados Financieros")
     st.markdown("Reportes automáticos basados en el Plan Contable General Empresarial (PCGE).")
 
-    df_saldos = lg.obtener_saldos_cuentas()
+    # --- PERIODO DEL ESTADO ---
+    # Aqui el periodo no es un filtro cosmetico: decide que cifras son correctas.
+    # Un Balance con Activos acumulados a la fecha de corte y Patrimonio tambien
+    # acumulado, pero Ingresos y Gastos tomados de toda la historia, no cuadra
+    # nunca. Por eso los Estados Financieros ahora piden el rango y separan el
+    # saldo acumulado del movimiento del periodo.
+    _ee_min, _ee_max = lg.obtener_rango_fechas_asientos()
+    if _ee_min is not None:
+        with st.container(border=True):
+            st.markdown("**Periodo del estado**")
+            ee1, ee2 = st.columns([2, 3])
+            with ee1:
+                rango_ee = st.date_input("Periodo", value=(_ee_min, _ee_max),
+                                         format="DD/MM/YYYY", key="ee_periodo")
+            with ee2:
+                st.caption("Las cuentas de Activo, Pasivo y Patrimonio muestran el saldo acumulado a la fecha "
+                           "de corte, y el Balance cierra con el resultado acumulado hasta esa misma fecha. El "
+                           "Estado de Resultados, en cambio, muestra solo los movimientos del rango (elementos "
+                           "6, 7, 8 y 9 del PCGE), porque su saldo historico acumulado no es el resultado del "
+                           "periodo.")
+        desde_ee, hasta_ee = _periodo(rango_ee)
+    else:
+        desde_ee = hasta_ee = None
+        st.info("Todavía no hay asientos registrados, así que los Estados Financieros no tienen periodo "
+                "que recortar. Se mostrara el acumulado historico disponible.")
+
+    df_saldos = lg.obtener_saldos_cuentas(desde_ee, hasta_ee)
+
+    # EL BALANCE NO SE ARMA CON `df_saldos`.
+    # El balance es una foto a la fecha de corte, asi que su linea de resultado
+    # necesita el resultado ACUMULADO hasta `hasta_ee` y no el del rango elegido: con
+    # el rango, la utilidad generada antes del periodo se leia como cero en el
+    # balance y la ecuacion Activo = Pasivo + Patrimonio se descuadraba sola.
+    # `obtener_saldos_cuentas(None, fecha_hasta)` ya aplica el corte acumulado a
+    # TODOS los elementos, resultados incluidos (ver `logica.py`), de modo que aqui no
+    # hace falta una segunda regla de calculo: es la misma funcion con otro periodo.
+    df_acumulado = lg.obtener_saldos_cuentas(None, hasta_ee)
 
     tab_balance, tab_resultados = st.tabs(["Balance General", "Estado de Resultados"])
 
@@ -1367,11 +1714,19 @@ elif menu == "Estados Financieros":
             activos = df_saldos[df_saldos['elemento'].isin([1, 2, 3])]
             pasivos_patrimonio = df_saldos[df_saldos['elemento'].isin([4, 5])]
 
-            # Calculamos la utilidad del periodo para cuadrar el balance
-            ingresos_tot = df_saldos[df_saldos['elemento'] == 7]['saldo'].sum()
-            gastos_tot = df_saldos[df_saldos['elemento'].isin([6, 9])]['saldo'].sum()
-            utilidad = ingresos_tot - gastos_tot
+            # Resultado del periodo → para el Estado de Resultados
+            ingresos_tot_per = df_saldos[df_saldos['elemento'] == 7]['saldo'].sum()
+            gastos_tot_per  = df_saldos[df_saldos['elemento'].isin([6, 9])]['saldo'].sum()
+            resultado_periodo = ingresos_tot_per - gastos_tot_per
 
+            # Resultado acumulado hasta fecha de corte → para el Balance
+            if df_acumulado is not None and not df_acumulado.empty:
+                ingresos_acum = df_acumulado[df_acumulado['elemento'] == 7]['saldo'].sum()
+                ingresos_acum = ingresos_acum + df_acumulado[df_acumulado['elemento'] == 8]['saldo'].sum()
+                gastos_acum   = df_acumulado[df_acumulado['elemento'].isin([6, 9])]['saldo'].sum()
+                resultado_acumulado = ingresos_acum - gastos_acum
+            else:
+                resultado_acumulado = 0.0
             col_activo, col_pasivo = st.columns(2)
 
             with col_activo:
@@ -1382,12 +1737,66 @@ elif menu == "Estados Financieros":
             with col_pasivo:
                 st.markdown("### Pasivos y Patrimonio")
                 st.dataframe(pasivos_patrimonio[['codigo', 'descripcion', 'saldo']].style.format({'saldo': 'S/ {:.2f}'}), hide_index=True, use_container_width=True)
-                if utilidad != 0:
-                    st.caption(f"*Utilidad del Ejercicio a distribuir: S/ {utilidad:,.2f}*")
+                if resultado_acumulado != 0:
+                    st.caption(f"*Resultado acumulado hasta {hasta_ee.strftime('%d/%m/%Y') if hasattr(hasta_ee,'strftime') else hasta_ee}: S/ {resultado_acumulado:,.2f}*")
 
-                total_p_y_p = pasivos_patrimonio['saldo'].sum() + utilidad
+                total_p_y_p = pasivos_patrimonio['saldo'].sum() + resultado_acumulado
                 st.error(f"**Total Pasivo + Patrimonio: S/ {total_p_y_p:,.2f}**")
 
+            # El PDF se arma con `df_saldos`, el mismo DataFrame ya filtrado por
+            # periodo que se esta mostrando, y con los subconjuntos que la pantalla
+            # ya calculo. Cero consultas adicionales: asi el documento y la
+            # pantalla no pueden discrepar por construccion.
+            def _filas_cuenta(subconjunto):
+                """`(codigo, descripcion, saldo)` de un subconjunto de df_saldos."""
+                return [(r["codigo"], r["descripcion"], float(r["saldo"]))
+                        for _, r in subconjunto.iterrows()]
+
+            _pasivos = df_saldos[df_saldos['elemento'] == 4]
+            _patrimonio = df_saldos[df_saldos['elemento'] == 5]
+            _total_pasivos = round(float(_pasivos['saldo'].sum()), 2)
+            _total_patrimonio = round(float(_patrimonio['saldo'].sum()), 2)
+
+            if abs(resultado_acumulado) < 1e-9:
+                etiqueta_utilidad = "SIN RESULTADO ACUMULADO"
+            elif resultado_acumulado > 0:
+                etiqueta_utilidad = "UTILIDAD ACUMULADA"
+            else:
+                etiqueta_utilidad = "PÉRDIDA ACUMULADA"
+
+            _pdf_balance = reportes_pdf.generar_pdf_balance_general(
+                df_acumulado,
+                {
+                    "periodo": (desde_ee, hasta_ee),
+                    "total_activos": round(float(activos['saldo'].sum()), 2),
+                    # Mismo importe que muestra el bloque de arriba, para que la
+                    # ecuacion del PDF cierre con la cifra que ve el usuario.
+                    "total_pasivo_patrimonio": round(total_p_y_p, 2),
+                    "utilidad": float(resultado_acumulado),
+                    "etiqueta_utilidad": etiqueta_utilidad,
+                },
+                bloques={
+                    # El activo se desglosa por elemento del PCGE, igual que en la
+                    # documentacion contable; cada subtotal es la suma de su bloque.
+                    "activos": [
+                        (lg.ETIQUETAS_ACTIVO.get(int(e), f"Activo {e}"),
+                         _filas_cuenta(activos[activos['elemento'] == e]),
+                         round(float(activos[activos['elemento'] == e]['saldo'].sum()), 2))
+                        for e in sorted(activos['elemento'].unique())
+                    ],
+                    "pasivos": _filas_cuenta(_pasivos),
+                    "patrimonio": _filas_cuenta(_patrimonio),
+                    "total_pasivos": _total_pasivos,
+                    "total_patrimonio": _total_patrimonio,
+                },
+            )
+            st.download_button(
+                "Exportar PDF",
+                data=_pdf_balance,
+                file_name=f"estado_situacion_financiera_{_sufijo_periodo(desde_ee, hasta_ee)}.pdf",
+                mime="application/pdf",
+                help="Genera el Estado de Situación Financiera en PDF con el periodo seleccionado.",
+            )
         else:
             st.info("Aún no hay registros para procesar el Balance General.")
 
@@ -1396,26 +1805,47 @@ elif menu == "Estados Financieros":
         st.info("Resume los ingresos y gastos del periodo para determinar la utilidad o pérdida del ejercicio.")
 
         if not df_saldos.empty:
-            ingresos = df_saldos[df_saldos['elemento'] == 7]
-            gastos = df_saldos[df_saldos['elemento'].isin([6, 9])]
+            ingresos_df = df_saldos[df_saldos['elemento'] == 7]
+            gastos_df = df_saldos[df_saldos['elemento'].isin([6, 9])]
 
             col_ing, col_gas = st.columns(2)
 
             with col_ing:
                 st.markdown("### Ingresos")
-                if not ingresos.empty:
-                    st.dataframe(ingresos[['codigo', 'descripcion', 'saldo']].style.format({'saldo': 'S/ {:.2f}'}), hide_index=True, use_container_width=True)
-                st.success(f"**Total Ingresos: S/ {ingresos_tot:,.2f}**")
+                if not ingresos_df.empty:
+                    st.dataframe(ingresos_df[['codigo', 'descripcion', 'saldo']].style.format({'saldo': 'S/ {:.2f}'}), hide_index=True, use_container_width=True)
+                st.success(f"**Total Ingresos: S/ {ingresos_tot_per:,.2f}**")
 
             with col_gas:
                 st.markdown("### Gastos")
-                if not gastos.empty:
-                    st.dataframe(gastos[['codigo', 'descripcion', 'saldo']].style.format({'saldo': 'S/ {:.2f}'}), hide_index=True, use_container_width=True)
-                st.error(f"**Total Gastos: S/ {gastos_tot:,.2f}**")
+                if not gastos_df.empty:
+                    st.dataframe(gastos_df[['codigo', 'descripcion', 'saldo']].style.format({'saldo': 'S/ {:.2f}'}), hide_index=True, use_container_width=True)
+                st.error(f"**Total Gastos: S/ {gastos_tot_per:,.2f}**")
 
             st.markdown("---")
-            color_utilidad = "normal" if utilidad >= 0 else "inverse"
-            st.metric(label="RESULTADO DEL EJERCICIO (Utilidad / Pérdida)", value=f"S/ {utilidad:,.2f}", delta_color=color_utilidad)
+            color_utilidad = "normal" if resultado_periodo >= 0 else "inverse"
+            st.metric(label="RESULTADO DEL EJERCICIO (Utilidad / Pérdida)", value=f"S/ {resultado_periodo:,.2f}", delta_color=color_utilidad)
+
+            _pdf_resultados = reportes_pdf.generar_pdf_estado_resultados(
+                df_saldos,
+                {
+                    "periodo": (desde_ee, hasta_ee),
+                    "ingresos": [(r["codigo"], r["descripcion"], float(r["saldo"]))
+                                 for _, r in ingresos_df.iterrows()],
+                    "total_ingresos": float(ingresos_tot_per),
+                    "gastos": [(r["codigo"], r["descripcion"], float(r["saldo"]))
+                               for _, r in gastos_df.iterrows()],
+                    "total_gastos": float(gastos_tot_per),
+                    "resultado": float(resultado_periodo),
+                },
+            )
+            st.download_button(
+                "Exportar PDF",
+                data=_pdf_resultados,
+                file_name=f"estado_resultados_integrales_{_sufijo_periodo(desde_ee, hasta_ee)}.pdf",
+                mime="application/pdf",
+                help="Genera el Estado de Resultados Integrales en PDF con los ingresos y gastos del periodo.",
+            )
         else:
             st.info("Aún no hay registros de ingresos o gastos para procesar.")
 
@@ -1430,6 +1860,10 @@ elif menu == "Dashboard Gerencial":
     total_pasivos = 0.0
     total_patrimonio = 0.0
     utilidad = 0.0
+    # Con la base recien inicializada todavia no hay saldo que calcular: las cuatro
+    # tarjetas se pintan en cero, que es el valor neutro que corresponde, en vez de
+    # dejar la cuarta sin valor definido y reventar la pagina con un NameError.
+    utilidad_dashboard = 0.0
 
     if not df_saldos.empty:
         # Filtramos matemáticamente usando el campo 'elemento' del PCGE
@@ -1439,14 +1873,13 @@ elif menu == "Dashboard Gerencial":
 
         ingresos = df_saldos[df_saldos['elemento'] == 7]['saldo'].sum()
         gastos = df_saldos[df_saldos['elemento'].isin([6, 9])]['saldo'].sum()
-        utilidad = ingresos - gastos
-
+        utilidad_dashboard = ingresos - gastos
     # Tarjetas de Métricas (KPIs)
     col1, col2, col3, col4 = st.columns(4)
     col1.metric(label="Activos Totales", value=f"S/ {total_activos:,.2f}")
     col2.metric(label="Pasivos Totales", value=f"S/ {total_pasivos:,.2f}")
     col3.metric(label="Patrimonio", value=f"S/ {total_patrimonio:,.2f}")
-    col4.metric(label="Utilidad del Ejercicio", value=f"S/ {utilidad:,.2f}")
+    col4.metric(label="Utilidad del Ejercicio", value=f"S/ {utilidad_dashboard:,.2f}")
 
     st.markdown("---")
     st.subheader("Saldos Actuales por Cuenta")

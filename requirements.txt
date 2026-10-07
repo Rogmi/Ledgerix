@@ -11,3 +11,8 @@ pdfplumber
 python-docx
 Pillow
 pytest
+
+# Maquetacion de los reportes PDF formales (Libro Diario, Libro Mayor,
+# Estado de Situacion Financiera y Estado de Resultados Integrales).
+# pdfplumber solo LEE PDF: no sirve para generarlos.
+reportlab

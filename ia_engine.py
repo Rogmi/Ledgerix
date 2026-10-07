@@ -11,6 +11,9 @@ from dotenv import load_dotenv
 from groq import Groq
 from PIL import Image
 
+from database import CATALOGO_PCGE
+from logica import naturaleza_de_elemento
+
 # 1. Cargar credenciales
 load_dotenv()
 cliente = Groq(api_key=os.getenv("GROQ_API_KEY"))
@@ -197,12 +200,31 @@ D. PARTIDA DOBLE
    ajustes y NO completes importes de una partida a otra para cuadrar: si no cuadra sin moverlos,
    devuelve el asiento descuadrado y márcalo con "revisar": true.
 
-E. DÓNDE ESTÁ ESCRITO EL DEBE Y EL HABER
-   Los rótulos de columna (Debe/Haber, Cargo/Crédito) mandan SOLO en las líneas SIN notación
-   propia. Si la línea trae notación, manda la sección A y el rótulo NO se aplica al signo: un
-   "CARGO / ABONO" arriba del libro NO convierte un "+" en cargo ni un "-" en abono. Rótulos y
-   notación pueden coexistir: aplica cada uno a lo que le corresponde. En ambos casos NO
-   deduzcas la columna por la posición, las tabulaciones, las sangrías ni la clase de la cuenta.
+E. DÓNDE ESTÁ ESCRITO EL DEBE Y EL HABER: SEPARA EL SIGNO DE LA COLUMNA DEL IMPORTE
+   Son dos datos distintos del documento y no se les puede aplicar lo mismo.
+   - EL SIGNO nunca es una columna: un "CARGO / ABONO" arriba del libro NO convierte un
+     "+" en cargo ni un "-" en abono, y la sección A manda igual sobre las líneas que
+     traen notación. No saques el lado de un "+" o de un "-".
+   - LA COLUMNA DEL IMPORTE sí es una columna. Las tablas llegan serializadas como
+     "descripción | celda | celda | celda": una celda VACÍA intercalada no es un importe,
+     pero la CUENTA, y el importe se lee en la columna en la que está escrito. Esa columna
+     es la del rótulo que la encabeza, y los rótulos de un libro se leen de izquierda a
+     derecha, en el MISMO orden en que están sus columnas.
+   - CALIBRA LAS COLUMNAS antes de fijar el lado, y calibra con el documento, no con la
+     clase de la cuenta. Los rótulos pueden estar en otra página del mismo libro: si los
+     tienes a la vista, sigue su orden de izquierda a derecha hasta las columnas de
+     importe. Si NO hay rótulo a la vista, deduce la correspondencia con las filas cuya
+     notación NO admite duda, y solo con esas: un ACTIVO que AUMENTA (10 Caja A+, 20
+     Inventarios A+) lleva su importe en la columna del DEBE, y un ACTIVO que DISMINUYE o
+     un INGRESO que AUMENTA (20 Inventarios A-, 70 Ingresos V+) lo llevan en la del HABER.
+     NO uses "todo lo que aumenta va al DEBE": un ingreso que aumenta va al HABER, igual
+     que una contra-activo que acumula. Con esa correspondencia fijada, aplícala a TODAS
+     las filas de la página aunque su notación parezca contradecirla: una línea
+     "39 ... -A" cuyo importe está en la columna que ya calibraste como HABER va al HABER.
+     El signo explica el efecto; la columna explica el lado.
+   - Si no puedes ver el rótulo NI calibrar las columnas, decide por el efecto de la
+     operación cruzado con la naturaleza de la cuenta (secciones A, B y C), nunca por la
+     clase de la cuenta ni por la sangría ni por el código.
 
 F. INCERTIDUMBRE
    Si dudas de la composición del asiento o del lado de alguna partida, NO lo resuelvas suponiendo
@@ -274,6 +296,95 @@ humana que una estructura inventada.
 Responde ÚNICAMENTE con el array JSON, sin markdown, sin explicaciones, sin comentarios
 y sin texto antes o después.
 """
+
+# --------------------------------------------------------------------------- #
+# EXCEPCION SOLO PARA HOJAS DE CALCULO
+# --------------------------------------------------------------------------- #
+# Este bloque NO forma parte de `instrucciones_agente_excel`, que sigue congelada y se
+# entrega byte a byte al PDF, al Word, al dictado y al escaner visual. Se concatena al
+# final unicamente cuando el documento es un Excel (`_prompt_para_origen`).
+#
+# Que corrige
+# -----------
+# Una hoja de calculo academica trae, junto a las operaciones, una frase que OBSERVA un
+# saldo en vez de describir un movimiento economico: "en el inventario se observa un
+# saldo final de 10,000 soles al cierre de mes". Esa frase no es una operacion, pero si
+# es informacion necesaria para determinar una operacion que la hoja NO escribe. Antes,
+# al transcribirla como si fuera un asiento, el libro llevaba esa economia DOS veces.
+#
+# Que NO cambia
+# -------------
+# El prompt base sigue mandando sobre todo lo demas: las operaciones escritas se
+# transcriben tal cual, con su fecha, su glosa y sus partidas, sin mover un importe.
+BLOQUE_EXCEL_DERIVACION = """
+
+EXCEPCION UNICA A LA REGLA 7, Y SOLO EN HOJAS DE CALCULO
+========================================================
+
+Este bloque sustituye a la regla 7 ("no deduzcas operaciones") unicamente para el
+documento que acabas de leer y unicamente para el caso de abajo. En un PDF, un Word o
+un dictado la regla 7 se mantiene intacta.
+
+1. UN SALDO QUE SE OBSERVA NO ES UNA OPERACION.
+   Si una frase del documento OBSERVA un saldo en lugar de describir un movimiento
+   economico ("en el inventario se observa un saldo final de 10,000 soles al cierre de
+   mes", "el saldo final de mercaderias es 10,000"), esa frase NO es una operacion
+   contable: no la devuelvas dentro del array de operaciones y no le inventes partidas,
+   aunque mencione cuentas o importes. Un saldo es el resultado de lo que ya ocurrio;
+   transcribirlo como asiento repetiria en el libro una economia que ya esta escrita en
+   las operaciones de arriba.
+
+2. ESE CONTEXTO SE DECLARA EN UNA CLAVE HERMANA.
+   Lo que si es CONTEXTO del caso se devuelve FUERA del array, en un objeto con dos
+   claves:
+
+   {"contexto": [{"tipo": "inventario_final", "importe": 10000}],
+    "operaciones": [ ... el array de operaciones, exactamente igual que siempre ... ]}
+
+   - "tipo" solo puede ser "inventario_inicial" o "inventario_final".
+   - "importe" es el numero tal como esta escrito en el documento.
+   - Si la frase que describe el saldo trae una fecha inequivoca ("cierre del
+     31/07/2020"), copiala tal cual en "fecha". Si no la trae, NO escribas "fecha": no
+     inventes una.
+   - Si el documento no trae ningun saldo que sirva para esto, responde solo el array de
+     operaciones, como hasta ahora.
+
+3. EL SISTEMA DERIVA LO QUE FALTA, NO TU.
+   Cuando declaras un "inventario_final", el sistema calcula por su cuenta la salida de
+   mercaderias del periodo (inventario inicial + compras - inventario final) y arma el
+   asiento de costo que la hoja no escribe. Tu no escribes ese asiento, ni sus cuentas,
+   ni su fecha: no los deduzcas ni los copies de ninguna parte.
+
+4. LO QUE SIGUE VALIENDO IGUAL.
+   - Las operaciones escritas se transcriben completas, con su fecha, su glosa y sus
+     partidas, sin cambiar ni un importe.
+   - "revisar": true e "incertidumbres" siguen siendo la forma de declarar que algo no
+     esta claro.
+   - No inventes operaciones, fechas ni cuentas que el documento no escriba.
+"""
+
+# Solo las hojas de calculo reciben el bloque de arriba. El nombre del archivo ya llega
+# en minusculas desde app.py, pero se normaliza aqui para que el selector no dependa de
+# quien lo llame.
+ORIGENES_EXCEL = ("xlsx", "xls")
+
+
+def _prompt_para_origen(origen):
+    """
+    Elige el prompt del extractor segun de donde venga el documento.
+
+    `instrucciones_agente_excel` es el prompt congelado y se entrega tal cual a PDF,
+    Word, dictado y escaner visual. Solo una hoja de calculo recibe, anadido al final,
+    `BLOQUE_EXCEL_DERIVACION`: el bloque se apoya en las reglas del prompt base (por eso
+    define una excepcion a la regla 7 y no la reemplaza), de modo que tiene que ir
+    DESPUES, nunca antes.
+
+    Un origen desconocido o ausente recibe el prompt base: ante la duda, no se añade
+    ningun bloque.
+    """
+    if str(origen or "").strip().lower() in ORIGENES_EXCEL:
+        return instrucciones_agente_excel + BLOQUE_EXCEL_DERIVACION
+    return instrucciones_agente_excel
 
 # 4. SANITIZACIÓN DE TEXTO (capa defensiva: la principal vive en app.py)
 _ESPACIOS_EXCESIVOS = re.compile(r"[ \t]{6,}")
@@ -406,9 +517,13 @@ _BLOQUE_CODIGO = re.compile(r"```(?:json|JSON)?\s*(.*?)```", re.DOTALL)
 class ResultadoIA(list):
     """Lista de operaciones con avisos de validación adjuntos (sigue siendo una list)."""
 
-    def __init__(self, operaciones, avisos):
+    def __init__(self, operaciones, avisos, contexto=None):
         super().__init__(operaciones)
         self.avisos = avisos
+        # Informacion que el documento OBSERVA pero no escribe como operacion (un saldo
+        # final de inventario). Solo la declara la hoja de calculo; en el resto de
+        # origenes queda vacia y no se usa.
+        self.contexto = list(contexto or [])
 
 
 def _quitar_marcas_ia(texto):
@@ -519,6 +634,134 @@ def _es_error_de_tamano_o_ritmo(error):
     if codigo in (413, 429):
         return True
     return "413" in texto or "429" in texto or "rate_limit" in texto or "too large" in texto
+
+
+# --------------------------------------------------------------------------- #
+# EL 429 DE GROQ SON DOS COSAS DISTINTAS
+# --------------------------------------------------------------------------- #
+# El mismo código HTTP 429 significa dos cosas que no se pueden tratar igual, y este
+# archivo las trataba como una sola:
+#
+#   - TPD (tokens por DÍA): la cuenta agotó su cuota diaria. No se recupera reintentando
+#     ni esperando 4 u 8 segundos. Groq lo dice con `x-should-retry: false` y un
+#     `retry-after` de minutos, y el mensaje trae el límite, lo usado y lo solicitado.
+#   - TPM (tokens por MINUTO): la petición llegó en ráfaga. Sí se resuelve esperando y
+#     reintentando, que es lo que el mecanismo de reintentos siempre quiso cubrir.
+#
+# Confundirlas costaba 16 segundos de esperas inútiles y un diagnóstico que decía
+# "(413/429)", dejando a quien lee el error sin saber que el problema era la cuota del día.
+# La API sí dice cuál es; este código es el que no lo escuchaba.
+_MARCA_CUOTA_DIARIA = re.compile(r"tokens per day|\bTPD\b", re.IGNORECASE)
+_CIFRAS_CUOTA = re.compile(r"(Limit|Used|Requested)\s*(\d[\d,]*)", re.IGNORECASE)
+_ESPERA_SUGERIDA = re.compile(
+    r"try again in\s+((?:\d+h)?(?:\d+m)?(?:\d+(?:[.,]\d+)?s)?)", re.IGNORECASE
+)
+
+# Techo de la espera que se puede tomar de un `retry-after`. El reintento vive dentro de
+# una petición de Streamlit: sin este tope, un `retry-after` de 20 minutos dejaría la
+# interfaz colgada y sin poder cancelarse.
+ESPERA_MAXIMA_POR_RETRY_AFTER = 60.0
+
+
+def _texto_del_error(error):
+    """Mensaje del error como lo devuelve el SDK, incluyendo el cuerpo de la respuesta."""
+    partes = [str(error)]
+    cuerpo = getattr(error, "body", None)
+    if cuerpo:
+        partes.append(cuerpo if isinstance(cuerpo, str) else json.dumps(cuerpo, ensure_ascii=False))
+    return "\n".join(partes)
+
+
+def _es_error_de_cuota_diaria(error):
+    """True solo ante un 429 de tokens por DÍA (TPD): agotar la cuota no se reintenta."""
+    if getattr(error, "status_code", None) != 429:
+        return False
+    return bool(_MARCA_CUOTA_DIARIA.search(_texto_del_error(error)))
+
+
+def _duracion_a_segundos(texto):
+    """Convierte la duración que escribe Groq ("20m13.056s") en segundos."""
+    encontrado = _ESPERA_SUGERIDA.search(texto or "")
+    if not encontrado:
+        return None
+    horas = re.search(r"(\d+)h", encontrado.group(1))
+    minutos = re.search(r"(\d+)m", encontrado.group(1))
+    segundos = re.search(r"(\d+(?:[.,]\d+)?)s", encontrado.group(1))
+    if not (horas or minutos or segundos):
+        return None
+    total = 0.0
+    if horas:
+        total += int(horas.group(1)) * 3600
+    if minutos:
+        total += int(minutos.group(1)) * 60
+    if segundos:
+        total += float(segundos.group(1).replace(",", "."))
+    return total
+
+
+def _segundos_de_retry_after(error):
+    """Cuánto sugiere la API esperar: primero su cabecera `retry-after`, luego su mensaje."""
+    cabeceras = getattr(getattr(error, "response", None), "headers", None) or {}
+    for clave in ("retry-after", "Retry-After"):
+        valor = cabeceras.get(clave)
+        if valor in (None, ""):
+            continue
+        try:
+            return float(str(valor).strip())
+        except (TypeError, ValueError):
+            continue
+    return _duracion_a_segundos(_texto_del_error(error))
+
+
+def _duracion_legible(segundos):
+    """20m13s, para que el mensaje se lea sin tener que mentalizar 1213.056."""
+    segundos = int(round(segundos))
+    if segundos < 60:
+        return f"{segundos}s"
+    if segundos < 3600:
+        return f"{segundos // 60}m {segundos % 60}s" if segundos % 60 else f"{segundos // 60}m"
+    return f"{segundos // 3600}h {(segundos % 3600) // 60}m"
+
+
+def _informe_de_cuota_diaria(error):
+    """Explica el 429 de TPD con los números que la propia API envía."""
+    texto = _texto_del_error(error)
+    cifras = {}
+    for clave, valor in _CIFRAS_CUOTA.findall(texto):
+        cifras.setdefault(clave.lower(), int(valor.replace(",", "")))
+
+    espera = _segundos_de_retry_after(error)
+    detalles = []
+    if "limit" in cifras:
+        detalles.append(f"límite {cifras['limit']:,} tokens/día")
+    if "used" in cifras:
+        detalles.append(f"usados {cifras['used']:,}")
+    if "requested" in cifras:
+        detalles.append(f"solicitados {cifras['requested']:,}")
+    if espera is not None:
+        detalles.append(f"la cuota se repone en {_duracion_legible(espera)}")
+
+    return (
+        "se alcanzó la CUOTA DIARIA de tokens de Groq (TPD"
+        + (": " + ", ".join(detalles) if detalles else "")
+        + "). No se reintenta porque con la cuota del día agotada los otros intentos "
+        "serían rechazados igual; vuelve a intentarlo cuando se reponga."
+    )
+
+
+def _espera_antes_de_reintentar(error, intento):
+    """
+    Espera previa a reintentar un 413/429 transitorio.
+
+    Conserva la espera por intento que ya existía y solo la sustituye cuando la API
+    indica cuánto falta (`retry-after`), que es más fiable que un valor fijo. Se acota
+    con `ESPERA_MAXIMA_POR_RETRY_AFTER` para no bloquear la interfaz.
+    """
+    predeterminada = ESPERA_ENTRE_INTENTOS * intento
+    sugerida = _segundos_de_retry_after(error)
+    if sugerida is None:
+        return predeterminada
+    return max(0.0, min(sugerida, ESPERA_MAXIMA_POR_RETRY_AFTER))
 
 
 def _es_error_de_modelo_no_disponible(error):
@@ -637,6 +880,83 @@ def _leer_fila(fila):
         "debe": _a_numero(fila.get("debe")),
         "haber": _a_numero(fila.get("haber")),
     }
+
+
+def _sin_acentos(texto):
+    """Minúsculas sin tildes: para comparar descripciones del catálogo sin depender de cómo se escribió."""
+    return "".join(
+        caracter for caracter in unicodedata.normalize("NFKD", str(texto or ""))
+        if not unicodedata.combining(caracter)
+    ).lower()
+
+
+def _es_envoltorio(objeto):
+    """
+    Un dict es envoltorio cuando declara, como listas, las operaciones que OBSERVA el
+    documento (su transcribe) o el contexto que declara aparte. `context` aparece como
+    variante de `contexto` en respuestas reales de la API y se lee igual.
+    """
+    return (
+        isinstance(objeto, dict)
+        and (
+            isinstance(objeto.get("operaciones"), list)
+            or isinstance(objeto.get("contexto"), list)
+            or isinstance(objeto.get("context"), list)
+        )
+    )
+
+
+def _separar_contexto(lote):
+    """
+    Separa el CONTEXTO que declara la IA del ARRAY DE OPERACIONES. Devuelve
+    (operaciones, contexto).
+
+    El caso normal es que la IA responda con el array plano, como siempre, y entonces el
+    contexto es vacío: el resultado es idéntico al de antes. Una hoja de cálculo puede
+    responder con un objeto {"contexto": [...], "operaciones": [...]}, y ahí se separan
+    las dos mitades para que el contexto nunca llegue a `procesar_dinamica_contable` como
+    si fuera una operación.
+
+    El envoltorio aparece en tres formas que son el mismo contrato: desnudo, como único
+    elemento de un array, o anidado dentro de un array junto a las operaciones planas. En
+    los tres casos el contenido autoritativo es el del envoltorio: la API real duplica las
+    operaciones dentro de él, así que si un array trae un envoltorio, sus `operaciones` y
+    su `contexto` valen por el array completo y los elementos planos se descartan para no
+    escribir dos veces la misma economía.
+
+    Con la clave "contexto" ausente, un dict desnudo es una operación y un array plano se
+    devuelve tal cual. No reordena, no agrupa y no completa nada.
+    """
+    if isinstance(lote, dict):
+        if _es_envoltorio(lote):
+            return _partes_del_envoltorio(lote)
+        return [lote], []
+    if isinstance(lote, list):
+        envoltorios = [e for e in lote if _es_envoltorio(e)]
+        if envoltorios:
+            operaciones = []
+            contexto = []
+            for envoltorio in envoltorios:
+                ops, ctx = _partes_del_envoltorio(envoltorio)
+                operaciones.extend(ops)
+                contexto.extend(ctx)
+            return operaciones, contexto
+        return [e for e in lote if isinstance(e, dict)], []
+    return [], []
+
+
+def _partes_del_envoltorio(objeto):
+    """
+    Separa el envoltorio {"contexto": [...], "operaciones": [...]} en sus dos mitades.
+    Cada mitad se devuelve tal como la IA la escribió (solo diccionarios).
+    """
+    contexto = objeto.get("contexto")
+    if contexto is None:
+        contexto = objeto.get("context")
+    return (
+        [e for e in (objeto.get("operaciones") or []) if isinstance(e, dict)],
+        [e for e in (contexto or []) if isinstance(e, dict)],
+    )
 
 
 def procesar_dinamica_contable(lote):
@@ -832,8 +1152,296 @@ def procesar_dinamica_contable(lote):
     return ResultadoIA(operaciones, avisos), avisos, None
 
 
+# --------------------------------------------------------------------------- #
+# 6.b CONTEXTO QUE PERMITE DERIVAR UNA OPERACION (solo hojas de calculo)
+# --------------------------------------------------------------------------- #
+# Que es CONTEXTO y que es OPERACION
+# ---------------------------------
+# Una operacion contable describe un movimiento economico: algo que pasa y que por eso
+# tiene doble partida. Un saldo que el documento OBSERVA ("se observa un saldo final de
+# 10,000 al cierre de mes") no describe ningun movimiento: es el residuo de los
+# movimientos ya escritos. Meterlo en el libro lo repetiria.
+#
+# Pero un saldo no es inutil: junto con las compras del periodo determina el costo de las
+# mercaderias que salieron del almacen. Ese costo SI es una operacion (la mercaderia
+# existe y se consume), y por eso se deriva como asiento, no como frase.
+#
+# Lo que NO se hace aqui
+# ----------------------
+# No hay ningun codigo de cuenta escrito a mano. Las cuentas se leen del catalogo PCGE
+# por lo que representan: la cuenta de mercaderias (un ACTIVO, elemento 2, que se
+# descarga) y la cuenta de costo de ventas (un RESULTADO, elemento 6, que lo recibe).
+# "69 al DEBE y 20 al HABER" no es una regla de este sistema, es el resultado de leer en
+# el plan de cuentas que papel tiene cada una.
+_ELEMENTO_INVENTARIO = 2
+_ELEMENTO_COSTOS = 6
+
+
+def _cuenta_por_naturaleza(elemento, patron_descripcion):
+    """
+    Localiza en el catálogo PCGE la cuenta que representa `patron_descripcion` dentro
+    del elemento `elemento` del plan de cuentas. Devuelve el código, o None si el
+    catálogo no describe ninguna cuenta con ese papel.
+
+    Se busca por lo que la cuenta REPRESENTA, no por un código escrito a mano: el mismo
+    criterio funciona si el ejercicio usa otra cuenta de mercaderías u otra de costo de
+    ventas dentro del mismo elemento.
+    """
+    for codigo, descripcion, elemento_de_la_cuenta in CATALOGO_PCGE:
+        if elemento_de_la_cuenta != elemento:
+            continue
+        if patron_descripcion in _sin_acentos(descripcion):
+            return codigo
+    return None
+
+
+# ============================================================================
+# NORMALIZACION DETERMINISTA DE LAS CUENTAS INFERIDAS EN UNA HOJA DE CALCULO
+# ============================================================================
+# Una hoja de calculo del caso solo trae fecha y glosa: la cuenta de cada economia la
+# INFIERE la IA y, en la practica, la acierta hasta la compra y la falla en los gastos
+# (escribe una cuenta de ingresos, activo o patrimonio donde va un gasto) y a veces
+# invierte una venta. Esta capa, SOLO activa para Excel, valida las cuentas inferidas
+# contra el plan de cuentas del ejercicio y corrige únicamente lo que tiene seguro: que
+# la glosa dice un gasto de un subtipo y la IA le puso al DEBE una cuenta de otra clase.
+# Lo que no se puede determinar (cuenta en el lado equivocado, asiento sin la cuenta que
+# la economia pide) no se inventa: queda marcado para revision humana.
+#
+# La regla Debe/Haber es la MISMA de todo el sistema, `logica.naturaleza_de_elemento`:
+# un gasto (elemento 6) es deudora y su aumento va al DEBE; una venta (elemento 7) es
+# acreedora y va al HABER. No se corrige, completa ni invierte nada sobre PDF, voz o
+# scanner: esos documentos traen sus cuentas escritas y solo la hoja las infiere.
+_CONCEPTOS_EXCEL = (
+    # (etiqueta, elemento, patron del catalogo, remapear, palabras que lo delatan)
+    ("gastos financieros", 6, "gastos financieros", True,
+     (("gastos", "financieros"), ("gasto", "financiero"), ("interes",), ("intereses",))),
+    ("gastos de personal", 6, "gastos de personal y directores", True,
+     (("gastos", "personal"), ("gasto", "personal"), ("sueldo",), ("sueldos",),
+      ("remuneracion",), ("remuneraciones",))),
+    ("gastos por tributos", 6, "gastos por tributos", True,
+     (("gastos", "tributos"), ("gasto", "tributo"), ("impuesto",), ("impuestos",), ("igv",))),
+    # "gastos" sin apellido: los operativos del caso. A falta de mas precision se leen
+    # como "gastos de servicios prestados por terceros", la cuenta de gasto generico.
+    ("gastos", 6, "servicios prestados por terceros", True,
+     (("gastos",), ("pago", "gastos"), ("gasto",))),
+    # Mercaderia comprada y venta: el modelo las acierta, la capa solo VALIDA su forma.
+    ("mercaderias", 2, "mercaderia", False,
+     (("mercaderia",), ("mercaderias",))),
+    ("venta", 7, "ventas", False,
+     (("venta",), ("ventas",), ("vendida",), ("vendidas",))),
+)
+
+
+def _concepto_de_glosa(glosa):
+    """
+    Identifica la economia que describe la glosa por PALABRAS COMPLETAS (sin acentos, en
+    minusculas), sin reglas de substring: "gastos" no se confunde con "gastaron" ni "pago"
+    con "pagar". Devuelve la entrada de `_CONCEPTOS_EXCEL` que cuadre, o None.
+    """
+    palabras = set(re.findall(r"[a-z0-9]+", _sin_acentos(glosa)))
+    if not palabras:
+        return None
+    for concepto in _CONCEPTOS_EXCEL:
+        for requerida in concepto[4]:
+            if all(palabra in palabras for palabra in requerida):
+                return concepto
+    return None
+
+
+def _normalizar_cuentas_excel(operaciones):
+    """
+    Valida y, solo en el caso seguro, corrije las cuentas que la IA infirio en una hoja
+    de calculo. Devuelve los avisos. Modifica en su lugar los dicts de `operaciones`:
+    la cuenta inferida se reemplaza por la cuenta del plan de cuentas solo cuando la
+    glosa declara el concepto y la partida que lo sustituye esta en el lado correcto
+    segun `naturaleza_de_elemento`; todo asiento tocado o no determinable se marca
+    `revisar`. Avisos y glosas son legibles por el humano que aprueba el borrador.
+    """
+    avisos = []
+    for indice, operacion in enumerate(operaciones, start=1):
+        glosa = operacion.get("glosa")
+        concepto = _concepto_de_glosa(glosa)
+        if concepto is None:
+            continue
+        asiento = operacion.get("asiento")
+        if not isinstance(asiento, list) or not asiento:
+            continue
+
+        etiqueta, elemento, patron, remapear, _ = concepto
+        cuenta_esperada = _cuenta_por_naturaleza(elemento, patron)
+        if cuenta_esperada is None:
+            avisos.append(
+                f"Asiento #{indice} ('{glosa}'): el plan de cuentas no describe la cuenta de "
+                f"{etiqueta}: se conserva lo que infirio la IA y queda para revision."
+            )
+            operacion["revisar"] = True
+            continue
+
+        lado = "debe" if naturaleza_de_elemento(elemento) == "deudora" else "haber"
+        perfil = [
+            (_a_cuenta(partida.get("cuenta")), _a_numero(partida.get(lado)) or 0.0)
+            for partida in asiento
+        ]
+
+        # La cuenta que la economia pide ya esta donde toca: la IA la acerto.
+        if any(cuenta == cuenta_esperada and importe > 0 for cuenta, importe in perfil):
+            continue
+
+        # Quien podria ocupar el lugar de la cuenta correcta: una partida con importe en
+        # el lado que la economia exige y un codigo distinto al esperado.
+        candidatas = [p for p in perfil if p[1] > 0 and p[0] != cuenta_esperada]
+
+        if remapear and len(candidatas) == 1:
+            cuenta_vieja = candidatas[0][0]
+            for partida in asiento:
+                if (
+                    _a_cuenta(partida.get("cuenta")) == cuenta_vieja
+                    and (_a_numero(partida.get(lado)) or 0.0) > 0
+                ):
+                    partida["cuenta"] = cuenta_esperada
+                    break
+            operacion["revisar"] = True
+            avisos.append(
+                f"Asiento #{indice} ('{glosa}'): la IA infirio la cuenta {cuenta_vieja} en el "
+                f"{lado.upper()} de '{etiqueta}' y el sistema la reemplazo por la {cuenta_esperada} "
+                "del plan de cuentas. Queda marcado para revision."
+            )
+        else:
+            operacion["revisar"] = True
+            avisos.append(
+                f"Asiento #{indice} ('{glosa}'): no se puede confirmar que la cuenta infirida "
+                f"corresponda a '{etiqueta}': queda marcado para revision humana."
+            )
+    return avisos
+
+
+def derivar_asientos_de_contexto(contexto, operaciones):
+    """
+    Arma la operación contable que el documento OBSERVA pero no escribe, a partir del
+    CONTEXTO que declaró la hoja de cálculo. Devuelve (asientos_derivados, avisos).
+
+    El único caso que cubre es el del ciclo de mercaderías:
+
+        COSTO DE VENTAS = inventario inicial + compras - inventario final
+
+    Las compras no se leen del contexto: son las que el documento ya escribió, y se toman
+    del DEBE de la cuenta de mercaderías en las operaciones transcritas. El inventario
+    final viene del contexto. El inventario inicial, si el documento no lo declara, se
+    asume 0.00 y el supuesto queda escrito en `incertidumbres`: es un dato que no está en
+    el documento y quien revise el borrador tiene que poder verlo.
+
+    Si falta un dato necesario NO se inventa: se avisa y no se deriva nada. El asiento que
+    sí sale llega siempre con "revisar": true, porque no está escrito en el documento y
+    lo decidió el sistema, no el documento.
+    """
+    avisos = []
+    declarados = {"inventario_inicial": [], "inventario_final": []}
+    fecha_contexto = ""
+
+    for entrada in contexto or []:
+        tipo = _sin_acentos(entrada.get("tipo"))
+        if tipo not in declarados:
+            avisos.append(
+                f"El contexto declara el tipo {entrada.get('tipo')!r}, que no se usa para derivar "
+                "asientos: se descarta como información, no como operación."
+            )
+            continue
+        valor = _a_numero(entrada.get("importe"))
+        if valor is None:
+            avisos.append(
+                f"El contexto de tipo '{entrada.get('tipo')}' no trae un importe utilizable: se ignora."
+            )
+            continue
+        declarados[tipo].append(valor)
+        fecha_contexto = fecha_contexto or _a_fecha(entrada.get("fecha"))
+
+    if not declarados["inventario_final"]:
+        return [], avisos
+
+    for tipo in ("inventario_inicial", "inventario_final"):
+        if len(declarados[tipo]) > 1:
+            avisos.append(f"El documento declara varios saldos de {tipo.replace('_', ' ')}: se suman.")
+
+    inventario_final = round(sum(declarados["inventario_final"]), 2)
+
+    cuenta_mercaderias = (
+        _cuenta_por_naturaleza(_ELEMENTO_INVENTARIO, "mercaderia")
+        or _cuenta_por_naturaleza(_ELEMENTO_INVENTARIO, "existencias")
+    )
+    if cuenta_mercaderias is None:
+        avisos.append("El catálogo PCGE no describe una cuenta de mercaderías: no se deriva el costo.")
+        return [], avisos
+
+    cuenta_costo = _cuenta_por_naturaleza(_ELEMENTO_COSTOS, "costo de ventas")
+    if cuenta_costo is None:
+        avisos.append("El catálogo PCGE no describe una cuenta de costo de ventas: no se deriva el asiento.")
+        return [], avisos
+
+    compras = 0.0
+    for operacion in operaciones or []:
+        for movimiento in operacion.get("asiento") or []:
+            if _a_cuenta(movimiento.get("cuenta")) == cuenta_mercaderias:
+                compras += _a_numero(movimiento.get("debe")) or 0.0
+    compras = round(compras, 2)
+
+    if compras <= 0:
+        avisos.append(
+            f"Las operaciones transcritas no cargan nada a la cuenta {cuenta_mercaderias}: sin compras "
+            "del periodo no hay costo de ventas que derivar."
+        )
+        return [], avisos
+
+    if declarados["inventario_inicial"]:
+        inventario_inicial = round(sum(declarados["inventario_inicial"]), 2)
+    else:
+        inventario_inicial = 0.0
+
+    costo = round(inventario_inicial + compras - inventario_final, 2)
+    if costo <= 0:
+        avisos.append(
+            f"El inventario del periodo (inicial {inventario_inicial:,.2f} + compras {compras:,.2f}) no supera "
+            f"el inventario final ({inventario_final:,.2f}): no sale mercadería y no se deriva asiento."
+        )
+        return [], avisos
+
+    incertidumbres = [
+        "el documento no escribe este asiento: el sistema lo derivó del inventario que el documento observa"
+    ]
+    if not declarados["inventario_inicial"]:
+        incertidumbres.append(
+            "el documento no declara el inventario inicial del periodo; se asumió 0.00"
+        )
+    if not fecha_contexto:
+        incertidumbres.append(
+            "el documento no da una fecha de cierre inequívoca: complete la fecha antes de aprobar"
+        )
+
+    derived = {
+        "fecha": fecha_contexto,
+        "glosa": (
+            "DERIVADO / REVISAR: costo de ventas por salida de mercadería "
+            f"(inv. inicial {inventario_inicial:,.2f} + compras {compras:,.2f} "
+            f"- inv. final {inventario_final:,.2f})"
+        ),
+        "razonamiento": "",
+        "revisar": True,
+        "incertidumbres": " | ".join(incertidumbres),
+        "asiento": [
+            {"cuenta": cuenta_costo, "debe": costo, "haber": 0.0},
+            {"cuenta": cuenta_mercaderias, "debe": 0.0, "haber": costo},
+        ],
+    }
+
+    avisos.append(
+        f"Asiento DERIVADO del saldo final de inventario: {cuenta_costo} al DEBE por {costo:,.2f} y "
+        f"{cuenta_mercaderias} al HABER por {costo:,.2f}. Queda marcado para revisión porque no está "
+        "escrito en el documento."
+    )
+    return [derived], avisos
+
+
 # 7. LLAMADA A LA API CON REINTENTOS
-def _consultar_agente(contenido_documento, max_completion_tokens):
+def _consultar_agente(contenido_documento, max_completion_tokens, prompt=None):
     parametros = {
         "model": MODELO_IA,
         "temperature": 0.1,
@@ -846,14 +1454,14 @@ def _consultar_agente(contenido_documento, max_completion_tokens):
 
     return cliente.chat.completions.create(
         messages=[
-            {"role": "system", "content": instrucciones_agente_excel},
+            {"role": "system", "content": prompt if prompt else instrucciones_agente_excel},
             {"role": "user", "content": f"Contenido del documento:\n{contenido_documento}"},
         ],
         **parametros,
     )
 
 
-def _procesar_bloque(contenido_bloque, indice, total, traza):
+def _procesar_bloque(contenido_bloque, indice, total, traza, prompt=None):
     """
     Procesa UN bloque y devuelve su ResultadoIA, o None si el bloque no se pudo
     leer completo.
@@ -870,13 +1478,20 @@ def _procesar_bloque(contenido_bloque, indice, total, traza):
         presupuesto = MAX_COMPLETION_TOKENS if intento == 1 else MAX_COMPLETION_TOKENS_REFUERZO
 
         try:
-            respuesta = _consultar_agente(contenido_bloque, presupuesto)
+            respuesta = _consultar_agente(contenido_bloque, presupuesto, prompt)
         except Exception as error:
+            if _es_error_de_cuota_diaria(error):
+                # La cuota de tokens del día está agotada: los intentos 2 y 3 serían
+                # rechazados con el mismo 429. Se corta aquí, sin esperas, y se dice por qué.
+                traza.append(f"Bloque {indice}/{total}, intento {intento}: {_informe_de_cuota_diaria(error)}")
+                return None
             if _es_error_de_tamano_o_ritmo(error):
+                espera = _espera_antes_de_reintentar(error, intento)
                 traza.append(
-                    f"Bloque {indice}/{total}, intento {intento}: la API rechazo el tamano o el ritmo (413/429)."
+                    f"Bloque {indice}/{total}, intento {intento}: la API rechazó el tamaño o el ritmo "
+                    f"(HTTP {getattr(error, 'status_code', '413/429')}); se reintenta en {espera:.0f} s."
                 )
-                time.sleep(ESPERA_ENTRE_INTENTOS * intento)
+                time.sleep(espera)
                 continue
             traza.append(f"Bloque {indice}/{total}, intento {intento}: error de la API: {error}")
             return None
@@ -903,19 +1518,36 @@ def _procesar_bloque(contenido_bloque, indice, total, traza):
             )
             continue
 
-        resultado, avisos, error_normalizacion = procesar_dinamica_contable(lote)
+        operaciones, contexto = _separar_contexto(lote)
+
+        if not operaciones:
+            # Un bloque que solo aporta contexto no tiene nada que validar. Se conserva
+            # el contexto y no se inventa un asiento para que el bloque "pase".
+            if contexto:
+                return ResultadoIA([], [], contexto)
+            traza.append(f"Bloque {indice}/{total}: sin operaciones utilizables.")
+            return None
+
+        resultado, avisos, error_normalizacion = procesar_dinamica_contable(operaciones)
         if resultado is None:
             detalle = " | ".join(avisos[:4]) if avisos else ""
             traza.append(
-                f"Bloque {indice}/{total}: {error_normalizacion}" + (f" Detalle: {detalle}" if detalle else "")
+                f"Bloque {indice}/{total}, intento {intento}: {error_normalizacion}"
+                + (f" Detalle: {detalle}" if detalle else "")
             )
-            return None
+            # Una respuesta que no trae ninguna fila utilizable es, casi siempre, una
+            # lectura fortuita: el mismo bloque devuelve filas legibles en el intento
+            # siguiente. No se declara fallido el bloque hasta agotar los reintentos,
+            # igual que con una respuesta truncada o sin JSON.
+            continue
+        if contexto:
+            resultado.contexto.extend(contexto)
         return resultado
 
     return None
 
 
-def analizar_excel_completo(texto_crudo_excel):
+def analizar_excel_completo(texto_crudo_excel, origen=None):
     """
     Envía el documento (Excel, PDF o Word) al extractor y devuelve (True, ResultadoIA)
     con los asientos ya normalizados y validados en Python, o (False, mensaje de error).
@@ -926,6 +1558,15 @@ def analizar_excel_completo(texto_crudo_excel):
     por lineas (`dividir_en_bloques`) y se procesa bloque por bloque: no se
     descarta ningun contenido, cada operacion llega entera y el orden del
     documento se conserva al concatenar los bloques en el orden en que se leyeron.
+
+    `origen` es la extension del archivo ("xlsx", "pdf", "docx") y decide el prompt:
+    solo una hoja de calculo recibe `BLOQUE_EXCEL_DERIVACION`. Con origen ausente o
+    desconocido se usa el prompt base.
+
+    Cuando la hoja de calculo declara CONTEXTO (un saldo que el documento observa pero no
+    escribe), el asiento que ese contexto permite determinar lo arma `derivar_asientos_de_contexto`
+    aqui, en Python y no la IA, y llega marcado para revision. Esa frase nunca se
+    transcribe como operacion.
     """
     documento = limpiar_texto_documento(texto_crudo_excel)
     if not documento:
@@ -935,6 +1576,9 @@ def analizar_excel_completo(texto_crudo_excel):
             "del enunciado o pega el texto."
         )
 
+    es_excel = str(origen or "").strip().lower() in ORIGENES_EXCEL
+    prompt = _prompt_para_origen(origen)
+
     bloques = dividir_en_bloques(documento)
     total_bloques = len(bloques)
     etiquetas = _etiquetas_de_pagina(documento, bloques)
@@ -943,10 +1587,10 @@ def analizar_excel_completo(texto_crudo_excel):
         f"{MAX_CHARS_ENTRADA:,} caracteres. No se omite ninguna linea."
     ]
 
-    operaciones, avisos = [], []
+    operaciones, avisos, contexto = [], [], []
     for indice, bloque in enumerate(bloques, start=1):
         contenido_bloque = _preparar_bloque(bloque, indice, total_bloques, etiquetas[indice - 1])
-        resultado = _procesar_bloque(contenido_bloque, indice, total_bloques, traza)
+        resultado = _procesar_bloque(contenido_bloque, indice, total_bloques, traza, prompt)
         if resultado is None:
             return False, (
                 f"El bloque {indice} de {total_bloques} no se pudo leer completo. No se devuelve un "
@@ -955,6 +1599,7 @@ def analizar_excel_completo(texto_crudo_excel):
             )
 
         operaciones.extend(resultado)
+        contexto.extend(getattr(resultado, "contexto", []) or [])
         avisos.extend(
             f"[Bloque {indice}/{total_bloques}] {aviso}"
             for aviso in getattr(resultado, "avisos", [])
@@ -962,6 +1607,17 @@ def analizar_excel_completo(texto_crudo_excel):
 
         if indice < total_bloques:
             time.sleep(_espera_entre_bloques(contenido_bloque))
+
+    # Solo una hoja de calculo infiere cuentas (PDF, voz y scanner las traen escritas):
+    # se validan contra el plan de cuentas antes de derivar, para que el asiento derivado
+    # parta de las cuentas ya corregidas.
+    if es_excel:
+        avisos.extend(_normalizar_cuentas_excel(operaciones))
+
+    if es_excel and contexto:
+        derivados, avisos_derivacion = derivar_asientos_de_contexto(contexto, operaciones)
+        operaciones.extend(derivados)
+        avisos.extend(avisos_derivacion)
 
     if not operaciones:
         return False, (
@@ -976,7 +1632,7 @@ def analizar_excel_completo(texto_crudo_excel):
             "aparecer momentáneamente como descuadrado: confírmalo contra el documento original."
         )
 
-    return True, ResultadoIA(operaciones, avisos)
+    return True, ResultadoIA(operaciones, avisos, contexto)
 
 
 # Alias con nombre acorde al nuevo flujo multipropósito (Excel, PDF y Word).
@@ -1016,8 +1672,10 @@ def extraer_asiento_de_texto(enunciado):
                 **parametros,
             )
         except Exception as error:
+            if _es_error_de_cuota_diaria(error):
+                return False, f"Error de conexión con la IA de Groq: {_informe_de_cuota_diaria(error)}"
             if _es_error_de_tamano_o_ritmo(error):
-                time.sleep(ESPERA_ENTRE_INTENTOS * intento)
+                time.sleep(_espera_antes_de_reintentar(error, intento))
                 continue
             return False, f"Error de conexión con la IA de Groq: {error}"
 
@@ -1326,11 +1984,19 @@ def analizar_imagen_comprobante(imagen_bytes, mime=None):
                 traza.append(f"Vision no habilitada en la cuenta: {error}")
                 print("[escaner visual] " + " | ".join(traza))
                 return False, MENSAJE_VISION_NO_HABILITADA
+            if _es_error_de_cuota_diaria(error):
+                # 429 por tokens por DÍA: la cuota del día se agotó y no se repone
+                # reintentando. Cortar aquí evita 16 s de esperas para nada.
+                informe = f"Intento {intento}: {_informe_de_cuota_diaria(error)}"
+                traza.append(informe)
+                print("[escaner visual] " + " | ".join(traza))
+                return False, f"Error de conexion con la IA Vision de Groq: {_informe_de_cuota_diaria(error)}"
             if _es_error_de_tamano_o_ritmo(error):
                 traza.append(
-                    f"Intento {intento}: la API rechazo el tamano de la imagen o el ritmo (413/429)."
+                    f"Intento {intento}: la API rechazo el tamano de la imagen o el ritmo "
+                    f"(HTTP {getattr(error, 'status_code', '413/429')})."
                 )
-                time.sleep(ESPERA_ENTRE_INTENTOS * intento)
+                time.sleep(_espera_antes_de_reintentar(error, intento))
                 continue
             return False, f"Error de conexion con la IA Vision de Groq: {error}"
 
