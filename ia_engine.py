@@ -810,11 +810,30 @@ def _a_numero(valor):
     return -numero if negativo else numero
 
 
+# Meses en letras para fechas dichas o escritas como "8 de julio de 2020" /
+# "8 de julio del 2020". El dictado por voz transcribe la fecha tal como se
+# habla, y un PDF puede traerla igual: la normalizacion es UNA sola para todos
+# los origenes, y este mapa solo ACEPTA formatos que antes se descartaban.
+_MESES_ES = {
+    "enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6,
+    "julio": 7, "agosto": 8, "septiembre": 9, "setiembre": 9, "octubre": 10,
+    "noviembre": 11, "diciembre": 12,
+}
+_FECHA_EN_LETRAS = re.compile(
+    r"^(\d{1,2})\s+de\s+([a-záéíóú]+)(?:\s+(?:de|del)\s+|\s+)(\d{4})$",
+    re.IGNORECASE,
+)
+
+
 def _a_fecha(valor):
     """
     Devuelve la fecha en ISO o "" si falta o no se puede interpretar. Nunca
     sustituye por la fecha de hoy: una fecha ausente queda ausente y se avisa
     para revision humana.
+
+    Ademas de los formatos numericos (AAAA-MM-DD, dd/mm/AAAA, dd-mm-AAAA,
+    yyyy/mm/dd, dd.mm.AAAA) acepta la fecha en letras del dictado:
+    "8 de julio de 2020" y "8 de julio del 2020".
     """
     if not valor:
         return ""
@@ -824,6 +843,15 @@ def _a_fecha(valor):
             return datetime.datetime.strptime(texto, patron).date().isoformat()
         except ValueError:
             continue
+    en_letras = _FECHA_EN_LETRAS.match(texto)
+    if en_letras:
+        dia, mes_txt, anio = en_letras.groups()
+        mes = _MESES_ES.get(_sin_acentos(mes_txt))
+        if mes:
+            try:
+                return datetime.date(int(anio), mes, int(dia)).isoformat()
+            except ValueError:
+                return ""
     return ""
 
 
@@ -1695,6 +1723,232 @@ def extraer_asiento_de_texto(enunciado):
         "La IA devolvió una respuesta vacía o ilegible tras varios intentos "
         f"(finish_reason={finish_reason}). Prueba a reformular el enunciado."
     )
+
+
+# --------------------------------------------------------------------------- #
+# 7.b DICTADO POR VOZ (misma tuberia que un documento)
+#
+# Antes el dictado usaba `extraer_asiento_de_texto`, cuyo contrato pedia SOLO la
+# lista plana de partidas (cuenta/debe/haber). Ese contrato no trae ni `fecha` ni
+# `glosa` ni la estructura multi-operacion, y de ahi salian los tres fallos
+# observados:
+#   1) la fecha nunca llegaba: app.py leia `resultado[0]["fecha"]`, clave que el
+#      contrato de partidas no contempla, y el borrador quedaba sin fecha aunque
+#      el enunciado la traia escrita;
+#   2) la glosa se armaba con los primeros 45 caracteres de la transcripcion cruda
+#      (fecha e importe incluidos), no con la descripcion de la operacion;
+#   3) una grabacion con varias transacciones se analizaba con un prompt que
+#      declara "UN solo asiento", asi que el modelo devolia todas las partidas
+#      fusionadas en un unico array (o un [] que cortaba el flujo).
+#
+# La correccion NO inventa un camino nuevo: el dictado sube por el MISMO pipeline
+# de documentos (`analizar_documento_completo` -> CONTRATO_MULTI_PARTIDA ->
+# `_extraer_json` -> `procesar_dinamica_contable`), de modo que una transcripcion
+# es un documento de texto y hereda multi-operacion, division por bloques,
+# reintentos, normalizacion de fecha y validacion de partida doble.
+#
+# Sobre lo que Python decide AQUI y no la IA:
+#   - FECHA: solo se conserva una fecha que este ESCRITA en la transcripcion
+#     (`fechas_en_texto`). Si la IA escribe una fecha que no aparece en el
+#     dictado, es una invencion y se vacia para revision humana. No se rellena
+#     con hoy ni con ningun valor supuesto.
+#   - GLOSA: se deriva de forma DETERMINISTA de la propia oracion transcrita
+#     (`glosa_desde_transcripcion`), quitando fecha, importes, moneda, muletillas
+#     y preposiciones colgantes, y conservando solo la descripcion de la
+#     operacion. No depende de que la IA redacte ni invente una glosa.
+# --------------------------------------------------------------------------- #
+
+# Numeros que la transcripcion escribe como fecha: 8.07.2020, 08/07/2020,
+# 08-07-2020 y 2020-07-08. El patron exige DOS separadores, asi que un importe
+# ("100.000", "5,000.00") nunca se confunde con una fecha.
+_FECHA_NUMERICA_TX = r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}"
+_FECHA_ISO_TX = r"\d{4}-\d{1,2}-\d{1,2}"
+_FECHA_LETRA_TX = r"\d{1,2}\s+de\s+[a-záéíóú]+(?:\s+(?:de|del)\s+|\s+)\d{4}"
+_PATRON_FECHA_TX = rf"(?:{_FECHA_LETRA_TX}|{_FECHA_ISO_TX}|{_FECHA_NUMERICA_TX})"
+
+# Candidatas a fecha tal como estan escritas en el texto. Cada candidata pasa por
+# `_a_fecha`: si no es una fecha real (mes inexistente, dia 32), se descarta.
+_CANDIDATAS_FECHA = re.compile(rf"\b(?:{_PATRON_FECHA_TX})\b", re.IGNORECASE)
+
+# Mismo patron con el articulo o la palabra "dia" que el hablante le pone por
+# delante ("El 01/07/2020 se compra..."): se quita junto con la fecha para que la
+# glosa no empiece con un articulo huérfano.
+_FECHA_CON_ARTICULO = re.compile(
+    rf"\b(?:(?:el|la|los|las|día)\s+)?(?:{_PATRON_FECHA_TX})\b", re.IGNORECASE
+)
+
+# Cortes de oracion: puntuacion y conectores de enumeracion que el hablante usa
+# para separar operaciones ("... soles. Luego se paga..." / "... contado, luego
+# se paga..."). El conector se descarta: es relleno, no descripcion.
+_CORTE_ORACION = re.compile(
+    r"(?<=[.!?;])\s+"
+    r"|(?<=\w)\s+(?:y\s+también|también|tambien|luego|después|despues|"
+    r"seguidamente|finalmente|posteriormente|a\s+continuación|a\s+continuacion)(?=\s+)",
+    re.IGNORECASE,
+)
+
+# Preposiciones y nexos que pueden quedar colgando tras quitar fecha e importe
+# ("empresa con 100.000 al contado" -> "empresa con al contado" -> "empresa al
+# contado"; "por 5,000 soles" -> "por").
+_NEXOS_GLOSA = ("con", "de", "del", "por", "para", "a", "al", "en", "desde",
+                "hasta", "sobre", "entre", "hacia", "sin", "e", "y")
+_PATRON_NEXOS = "|".join(_NEXOS_GLOSA)
+
+# Relleno hablado que no describe la operacion.
+_RUIDO_GLOSA = re.compile(
+    r"\b(?:luego|después|despues|seguidamente|también|tambien|finalmente|"
+    r"posteriormente|a continuación|a continuacion|ahora|primero|primera|"
+    r"acto seguido)\b",
+    re.IGNORECASE,
+)
+_RUIDO_IMPORTE = re.compile(r"\b\d[\d.,]*\b")
+_RUIDO_MONEDA = re.compile(
+    r"\b(?:soles|nuevos soles|dólares|dolares|dólar|dolar|dolares americanos)\b",
+    re.IGNORECASE,
+)
+
+
+def fechas_en_texto(texto):
+    """
+    Fechas REALES escritas en la transcripcion, en ISO y sin repetir.
+
+    Es la fuente de verdad de la fecha del dictado: lo que no esta escrito en el
+    texto no puede viajar al borrador, venga de donde venga. Formatos que acepta:
+    8.07.2020, 08/07/2020, 08-07-2020, 2020-07-08, "8 de julio de 2020" y
+    "8 de julio del 2020". Si no hay ninguna, devuelve un conjunto vacio: el
+    borrador queda SIN fecha para revision humana, nunca con una inventada.
+    """
+    if not texto:
+        return set()
+    encontradas = set()
+    for candidata in _CANDIDATAS_FECHA.finditer(str(texto)):
+        iso = _a_fecha(candidata.group(0))
+        if iso:
+            encontradas.add(iso)
+    return encontradas
+
+
+def oraciones_de_dictado(texto):
+    """
+    Divide la transcripcion en oraciones para emparejarlas, una a una, con las
+    operaciones que devolvio la IA. Corta por puntuacion y por conectores de
+    enumeracion; nunca corta dentro de una fecha ("8.07.2020" no se parte porque
+    el corte exige espacio justo despues del punto).
+    """
+    if not texto:
+        return []
+    return [parte.strip() for parte in _CORTE_ORACION.split(str(texto)) if parte and parte.strip()]
+
+
+def glosa_desde_transcripcion(texto):
+    """
+    Glosa DETERMINISTA de una oracion transcrita: conserva la descripcion de la
+    operacion y quita fecha, importes, moneda, muletillas y nexos colgantes.
+
+        "8.07.2020 se crea una empresa con 100.000 al contado."
+         -> "Se crea una empresa al contado"
+
+    No usa la IA ni el catalogo: es la misma limpieza para todo el dictado. Si
+    tras limpiar no queda nada, devuelve "" y el llamador decide (nunca inventa
+    una glosa a partir de nada).
+    """
+    if not texto:
+        return ""
+    limpio = unicodedata.normalize("NFKC", str(texto))
+    limpio = _CARACTERES_OCULTOS.sub("", limpio)
+    limpio = _FECHA_CON_ARTICULO.sub(" ", limpio)
+    limpio = _CANDIDATAS_FECHA.sub(" ", limpio)
+    limpio = _RUIDO_IMPORTE.sub(" ", limpio)
+    limpio = _RUIDO_MONEDA.sub(" ", limpio)
+    limpio = limpio.replace("S/", " ")
+    limpio = _RUIDO_GLOSA.sub(" ", limpio)
+    limpio = re.sub(r"\s+", " ", limpio).strip()
+
+    # Nexos colgantes: un nexo solo se quita si va seguido de OTRO nexo ("con
+    # al") o si queda al final de la oracion ("... por"). "al contado" o
+    # "de la oficina" no se tocan: ahi el nexo si enlaza palabras reales.
+    for _ in range(5):
+        antes = limpio
+        limpio = re.sub(
+            rf"\b(?:{_PATRON_NEXOS})\b(?=\s+(?:{_PATRON_NEXOS})\b)", " ", limpio, flags=re.IGNORECASE
+        )
+        limpio = re.sub(rf"(?:^|\s+)(?:{_PATRON_NEXOS})\s*\.?$", " ", limpio, flags=re.IGNORECASE)
+        limpio = re.sub(r"\s+", " ", limpio).strip(" ,;:")
+        if limpio == antes:
+            break
+
+    limpio = re.sub(r"^[yY]\s+", "", limpio).strip(" .,;:!?")
+    if not limpio:
+        return ""
+    return limpio[0].upper() + limpio[1:]
+
+
+def analizar_dictado(texto):
+    """
+    Analiza una transcripcion de voz y devuelve (True, ResultadoIA) con las
+    operaciones ya normalizadas y validadas, o (False, mensaje de error).
+
+    Flujo: transcripcion -> `analizar_documento_completo` (mismo pipeline, prompt
+    y validacion que PDF/Word) -> correcciones propias del dictado:
+      - FECHA: solo se conserva una fecha escrita en la transcripcion. Una fecha
+        que la IA escribio pero que no esta en el texto se VACIA (es una
+        invencion); si el texto trae una sola fecha y la IA no la uso, se toma
+        esa. Sin fecha en el texto -> sin fecha en el borrador, con aviso.
+      - GLOSA: se deriva de la oracion que describe cada operacion cuando la
+        segmentacion coincide; si no, de la glosa que trajo la IA limpiada con el
+        MISMO limpiador determinista. Nunca queda vacia si el texto dice algo.
+    """
+    exito, resultado = analizar_documento_completo(texto, origen=None)
+    if not exito:
+        return False, resultado
+
+    detectadas = fechas_en_texto(texto)
+    avisos = list(getattr(resultado, "avisos", []) or [])
+
+    for operacion in resultado:
+        if not isinstance(operacion, dict):
+            continue
+        fecha = operacion.get("fecha") or ""
+        if fecha in detectadas:
+            continue
+        if len(detectadas) == 1:
+            operacion["fecha"] = next(iter(detectadas))
+        elif fecha:
+            operacion["fecha"] = ""
+            avisos.append(
+                f"Asiento '{operacion.get('glosa') or 'sin glosa'}': la fecha que devolvio la IA "
+                "no aparece en la transcripcion; se dejo vacia para revision humana."
+            )
+        # Sin fechas detectadas y sin fecha de la IA no se añade nada: el
+        # normalizador ya aviso "no tiene una fecha interpretable".
+
+    oraciones = oraciones_de_dictado(texto)
+    if len(oraciones) == len(resultado):
+        for operacion, oracion in zip(resultado, oraciones):
+            if not isinstance(operacion, dict):
+                continue
+            glosa = glosa_desde_transcripcion(oracion) or glosa_desde_transcripcion(operacion.get("glosa") or "")
+            if glosa:
+                operacion["glosa"] = glosa
+    else:
+        # La segmentacion no coincide con las operaciones (el hablante no uso
+        # puntuacion, o la IA agrupo dos frases en un asiento): se limpia la glosa
+        # que trajo la IA con el MISMO limpiador, y si tampoco dice nada se usa el
+        # texto completo ya limpio.
+        for operacion in resultado:
+            if not isinstance(operacion, dict):
+                continue
+            glosa = (
+                glosa_desde_transcripcion(operacion.get("glosa") or "")
+                or glosa_desde_transcripcion(texto)
+            )
+            if glosa:
+                operacion["glosa"] = glosa
+
+    if isinstance(resultado, ResultadoIA):
+        resultado.avisos = avisos
+    return True, resultado
+
 
 # --------------------------------------------------------------------------- #
 # 8. ESCÁNER VISUAL (Groq Vision)

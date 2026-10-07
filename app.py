@@ -1289,17 +1289,32 @@ elif menu == "Registro de Transacciones":
                             st.error("El texto transcrito está vacío.")
                         else:
                             with st.spinner("La IA está analizando el dictado aplicando el PCGE..."):
-                                exito_ia, resultado_ia=ia.extraer_asiento_de_texto(texto_a_enviar)
-                                if not exito_ia:
-                                    st.error(f"Error de procesamiento: {resultado_ia}")
-                                elif not isinstance(resultado_ia,list) or not resultado_ia:
-                                    st.error("La IA no devolvió partidas utilizables para este enunciado.")
-                                else:
-                                    glosa_corta=(texto_a_enviar[:45]+"...") if len(texto_a_enviar)>45 else texto_a_enviar
-                                    fecha_voz = resultado_ia[0].get("fecha", "") if isinstance(resultado_ia, list) and resultado_ia and isinstance(resultado_ia[0], dict) else ""
-                                    cargar_borrador([{"fecha": fecha_voz, "glosa": glosa_corta, "asiento": resultado_ia}], "dictado por voz")
-                                    st.session_state.pop("texto_voz",None)
-                                    st.rerun()
+                                # Mismo pipeline que PDF/Word: contrato multi-operacion
+                                # (fecha + glosa + asiento por operacion), validacion de
+                                # partida doble y normalizacion de fecha. La fecha que
+                                # viaja al borrador es SOLO la escrita en la transcripcion
+                                # y la glosa se deriva deterministicamente de cada
+                                # oracion (ver ia.analizar_dictado).
+                                exito_ia, resultado_ia=ia.analizar_dictado(texto_a_enviar)
+                            if not exito_ia:
+                                st.error(f"Error de procesamiento: {resultado_ia}")
+                            elif not isinstance(resultado_ia,list) or not resultado_ia:
+                                st.error("La IA no devolvió operaciones utilizables para este dictado.")
+                            else:
+                                # Una grabacion con varias transacciones genera varios
+                                # asientos, cada uno con su fecha y su glosa: entran al
+                                # borrador comun, igual que un PDF o un Excel.
+                                cargar_borrador(list(resultado_ia), "dictado por voz")
+                                st.session_state.avisos_borrador = getattr(resultado_ia, "avisos", [])
+                                filas_voz = sum(
+                                    len(op.get("asiento") or [])
+                                    for op in resultado_ia if isinstance(op, dict)
+                                )
+                                st.session_state.resumen_borrador = (
+                                    f"{filas_voz} partida(s) en {len(resultado_ia)} asiento(s)."
+                                )
+                                st.session_state.pop("texto_voz",None)
+                                st.rerun()
                 with col2:
                     if st.button("Limpiar texto transcrito", use_container_width=True):
                         st.session_state.pop("texto_voz",None)
@@ -1336,7 +1351,11 @@ elif menu == "Registro de Transacciones":
                 st.image(imagen_final, caption="Documento listo para analizar", width=350)
 
                 if st.button("Escanear Imagen y Extraer Asiento", type="primary", use_container_width=True):
-                    with st.spinner("Llama 3.2 Vision está analizando el comprobante..."):
+                    # Nombre de modelo generico a proposito: Groq retiro los llama-3.2
+                    # vision y el modelo efectivo se configura por MODELO_VISION. Si la
+                    # cuenta no tiene vision habilitada, `analizar_imagen_comprobante`
+                    # devuelve un mensaje controlado y el resto del sistema sigue.
+                    with st.spinner("El escáner visual está analizando la imagen..."):
                         # getvalue() entrega los bytes crudos: es lo que espera el motor
                         # visual. read() con decodificacion daria texto y no una imagen.
                         imagen_bytes = imagen_final.getvalue()
