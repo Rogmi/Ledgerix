@@ -1965,12 +1965,15 @@ def analizar_dictado(texto):
 # tiene.
 # --------------------------------------------------------------------------- #
 
-# Configurable por entorno para no dejar el modelo clavado en el codigo: Groq retiro
-# `llama-3.2-90b-vision-preview` Y `llama-3.2-11b-vision-preview` en la misma fecha
-# (04/14/25). Para los dos, Groq declara como unico reemplazo valido este
-# `meta-llama/llama-4-scout-17b-16e-instruct`. Si Groq degrada este a su vez, basta
-# con `MODELO_VISION=...` en `.env`, sin tocar codigo.
-MODELO_VISION = os.getenv("MODELO_VISION", "meta-llama/llama-4-scout-17b-16e-instruct")
+# Modelo DEDICADO del escaner visual. El resto del sistema (PDF, Excel, voz) sigue
+# en `MODELO_IA` y no se toca: la division es intencionada, cada flujo tiene su
+# modelo. Se eligio `qwen/qwen3.8-27b` porque es el unico modelo multimodal al que
+# esta cuenta de Groq tiene acceso (verificado: acepta image_url y responde; los
+# `meta-llama/llama-4-scout` y `llama-3.2-*-vision` devuelven 404 model_not_found).
+# Si Groq lo retirara a su vez, `_es_error_de_modelo_no_disponible` corta al primer
+# intento y da el mensaje accionable; o se puede sobreescribir con
+# `MODELO_VISION=...` en `.env`, sin tocar codigo.
+MODELO_VISION = os.getenv("MODELO_VISION", "qwen/qwen3.8-27b")
 
 # Techo de la imagen ANTES de optimizar. Una foto de movil de 12 MP pesa varios MB y
 # su version en base64 es ~33% mas grande: mandarla sin limite produce un 413 de la
